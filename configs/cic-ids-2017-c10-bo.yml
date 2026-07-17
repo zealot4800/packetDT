@@ -1,0 +1,376 @@
+---
+dataset:
+  path: "dataset"
+  name: "CIC-IDS-2017-PCAPS1-f10"
+  format: "CIC-IDS-2017_Flow_v{}_c{}.csv"
+  num_partitions: [1, 2, 3, 4, 5, 6, 7, 1024] # 1024 implies netbeacon phases
+  destination: "."
+  num_classes: 10
+
+# dashboard db parameters
+dashboards:
+  template: "grafana/templates/cap-template.json"
+  provisioned: "grafana/provisioning/dashboards/"
+
+database:
+  dbname: "decision_trees"
+  user: "postgres"
+  password: "postgres"
+  host: "localhost"
+  port: 5432
+
+# switch model for resourse estimation
+switch_model:
+  # only one of them can be true
+  use_tofino1: True
+  use_tofino2: False
+
+  tofino1:
+    feature_width: 32
+    node_id_width: 16
+    num_ma_units: 12
+    bookkeeping_stages: 1
+    iat_bookkeeping_stages: 1
+    resubmission_bits_per_pkt: 48 # 32-bit flow hash + next node id
+    resubmission_bw_Gbps: 10 # Gbps per pipeline
+
+  tofino2:
+    feature_width: 32
+    node_id_width: 16
+    num_ma_units: 20
+    bookkeeping_stages: 1
+    iat_bookkeeping_stages: 1
+    resubmission_bits_per_pkt: 48 # 32-bit flow hash + next node id
+    resubmission_bw_Gbps: 10 # Gbps per pipeline
+
+leo: # hardcoded switch resources for tofino1
+  # depths: [3, 5, 7, 9, 11]
+  depths: [3, 4, 5, 6, 7, 8, 9, 10, 11]
+  features: [1, 2, 3, 4, 5, 6, 7]
+  # features: [4, 5, 6, 7]
+  pareto_front:
+    - max_depth: 3
+      f1_score: 0.24
+      num_flows: 1966080
+      num_features: 1
+      num_tcam_rules: 2048
+
+    - max_depth: 3
+      f1_score: 0.22
+      num_flows: 983040
+      num_features: 2
+      num_tcam_rules: 2048
+
+    - max_depth: 8
+      f1_score: 0.54
+      num_flows: 786432
+      num_features: 2
+      num_tcam_rules: 2048
+
+    - max_depth: 8
+      f1_score: 0.69
+      num_flows: 491520
+      num_features: 3
+      num_tcam_rules: 2048
+
+    - max_depth: 9
+      f1_score: 0.86
+      num_flows: 393216
+      num_features: 4
+      num_tcam_rules: 4096
+
+    - max_depth: 11
+      f1_score: 0.87
+      num_flows: 294912
+      num_features: 4
+      num_tcam_rules: 16384
+
+    - max_depth: 5
+      f1_score: 0.41
+      num_flows: 1769472
+      num_features: 1
+      num_tcam_rules: 2048
+
+    - max_depth: 6
+      f1_score: 0.52
+      num_flows: 884736
+      num_features: 2
+      num_tcam_rules: 2048
+
+    - max_depth: 10
+      f1_score: 0.7
+      num_flows: 589824
+      num_features: 3
+      num_tcam_rules: 8192
+
+    - max_depth: 10
+      f1_score: 0.87
+      num_flows: 262144
+      num_features: 4
+      num_tcam_rules: 8192
+
+    - max_depth: 8
+      f1_score: 0.37
+      num_flows: 1572864
+      num_features: 1
+      num_tcam_rules: 2048
+
+    - max_depth: 10
+      f1_score: 0.87
+      num_flows: 196608
+      num_features: 6
+      num_tcam_rules: 8192
+
+    - max_depth: 10
+      f1_score: 0.35
+      num_flows: 1376256
+      num_features: 1
+      num_tcam_rules: 8192
+
+    - max_depth: 10
+      f1_score: 0.55
+      num_flows: 688128
+      num_features: 2
+      num_tcam_rules: 8192
+
+    - max_depth: 11
+      f1_score: 0.35
+      num_flows: 1179648
+      num_features: 1
+      num_tcam_rules: 16384
+
+    - max_depth: 11
+      f1_score: 0.87
+      num_flows: 65536
+      num_features: 7
+      num_tcam_rules: 16384
+
+leo_nc:
+  depths: [9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39, 41, 43, 45, 47, 49, 51]
+  features: [50]
+  pareto_front:
+    - max_depth: 13
+      f1_score: 0.86
+      num_features: 40
+
+netbeacon:
+  depths: [3, 5, 7, 9, 10, 13, 15]
+  features: [1, 2, 3, 4, 5, 6]
+  # features: [4, 5, 6]
+  # phases: [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+  phases: [2, 4, 8, 32, 256, 512, 2048]
+  pareto_front:
+    - max_depth: 5
+      f1_score: 0.57
+      num_flows: 1966080
+      num_features: 1
+      num_tcam_rules: 205
+
+    - max_depth: 7
+      f1_score: 0.57
+      num_flows: 983040
+      num_features: 2
+      num_tcam_rules: 407
+
+    - max_depth: 5
+      f1_score: 0.6
+      num_flows: 786432
+      num_features: 3
+      num_tcam_rules: 251
+
+    - max_depth: 13
+      f1_score: 0.57
+      num_flows: 491520
+      num_features: 4
+      num_tcam_rules: 985
+
+    - max_depth: 10
+      f1_score: 0.58
+      num_flows: 393216
+      num_features: 5
+      num_tcam_rules: 839
+
+    - max_depth: 10
+      f1_score: 0.58
+      num_flows: 294912
+      num_features: 6
+      num_tcam_rules: 878
+
+netbeacon_nc:
+  depths: [9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39, 41, 43, 45, 47, 49, 51]
+  features: [50]
+  phases: [2, 4, 8, 32, 256, 512, 2048]
+  pareto_front:
+
+small_flow:
+  depth: 12
+  features: 8
+  pareto_front:
+    - max_depth: 12
+      f1_score: 0.56
+      num_features: 8
+
+iisy:
+  depths: [14, 13, 12, 11, 10, 10]
+  features: [2, 4, 5, 8, 10, 14]
+  pareto_front:
+    - max_depth: 13
+      f1_score: 0.55
+      num_features: 4
+
+one_partition:
+  depths: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  features: [1, 2, 3, 4, 5, 6, 7]
+  pareto_front:
+    - max_depth: 5
+      f1_score: 0.41
+      num_flows: 1966080
+      num_features: 1
+      num_tcam_rules: 23
+
+    - max_depth: 10
+      f1_score: 0.55
+      num_flows: 983040
+      num_features: 2
+      num_tcam_rules: 76
+
+    - max_depth: 13
+      f1_score: 0.79
+      num_flows: 786432
+      num_features: 3
+      num_tcam_rules: 278
+
+    - max_depth: 14
+      f1_score: 0.91
+      num_flows: 491520
+      num_features: 4
+      num_tcam_rules: 158
+
+    - max_depth: 13
+      f1_score: 0.88
+      num_flows: 393216
+      num_features: 7
+      num_tcam_rules: 153
+
+    - max_depth: 13
+      f1_score: 0.89
+      num_flows: 294912
+      num_features: 6
+      num_tcam_rules: 143
+
+# select op mode: only meant for CAP models
+operational_mode:
+  single_run: False
+  bruteforce: False
+  hypermapper: True
+
+single_run:
+  depth: 37
+  features_per_partition: 4
+  c1: 0.50
+  c2: 0.25
+  c3: 0.50
+  c4: 1.00
+  c5: 0.00
+  c6: 0.00
+
+bruteforce:
+  max_cuts: 512
+  num_jobs: 16
+  parameter_space:
+    depths: [37, 35, 33, 31, 29, 27, 25, 23, 21, 19, 17, 15, 13]
+    features_per_partition: [4, 3, 2]
+    c1: [0.00, 0.25, 0.50, 0.75, 1.00]
+    c2: [0.00, 0.25, 0.50, 0.75, 1.00]
+    c3: [0.00, 0.25, 0.50, 0.75, 1.00]
+    c4: [0.00, 0.25, 0.50, 0.75, 1.00]
+    c5: [0.00, 0.25, 0.50, 0.75, 1.00]
+    c6: [0.00, 0.20, 0.40, 0.60, 0.80]
+
+hypermapper:
+  script_path: "hypermapper-src/scripts/hypermapper.py"
+
+  scenario:
+    hypermapper_mode:
+      mode: "client-server"
+
+    design_of_experiment:
+      doe_type: "random sampling"
+      number_of_samples: 200
+
+    output_data_file: "output_samples.csv"
+    log_file: "hypermapper_log.log"
+
+    # parameter space
+    input_parameters:
+      depth:
+        parameter_type: "integer"
+        values: [10, 50]
+      features_per_partition:
+        parameter_type: "ordinal"
+        values: [2, 3, 4]
+      c1:
+        parameter_type: "ordinal"
+        values: [0.0, 0.25, 0.5, 0.75, 1.0]
+        # prior: [0.5, 0.125, 0.125, 0.125, 0.125]
+      c2:
+        parameter_type: "ordinal"
+        values: [0.0, 0.25, 0.5, 0.75, 1.0]
+        # prior: [0.5, 0.125, 0.125, 0.125, 0.125]
+      c3:
+        parameter_type: "ordinal"
+        values: [0.0, 0.25, 0.5, 0.75, 1.0]
+        # prior: [0.5, 0.125, 0.125, 0.125, 0.125]
+      c4:
+        parameter_type: "ordinal"
+        values: [0.0, 0.25, 0.5, 0.75, 1.0]
+        # prior: [0.5, 0.125, 0.125, 0.125, 0.125]
+      c5:
+        parameter_type: "ordinal"
+        values: [0.0, 0.25, 0.5, 0.75, 1.0]
+        # prior: [0.5, 0.125, 0.125, 0.125, 0.125]
+      c6:
+        parameter_type: "ordinal"
+        values: [0.0, 0.2, 0.4, 0.6, 0.8]
+        # prior: [0.5, 0.125, 0.125, 0.125, 0.125]
+
+    # options: "f1_score", "num_flows"
+    optimization_objectives: ["f1_score", "num_flows"]
+
+    # feasibility
+    check_feasibility: False # set to True if you want to check
+    feasible_output: # only works if check_feasiblity is True
+      enable_feasible_predictor: true
+      name: "feasible"
+      true_value: "True"
+      false_value: "False"
+
+    # evaluation parameters
+    optimization_iterations: 500
+    evaluations_per_optimization_iteration: 16
+
+    # options: "bayesian_optimization", "local_search", "evolutionary_optimization"
+    optimization_method: "bayesian_optimization"
+
+    # bayesian options
+    bayesian_optimization:
+      # BO options: "EI", "PI", "LCB"
+      acquisition_function: "EI"
+      # BO options: "linear", "tchebyshev", "modified_tchebyshev"
+      scalarization_method: "tchebyshev"
+
+    # local search options
+    local_search:
+      local_search_starting_points: 10
+      local_search_random_points: 10000
+      local_search_evaluation_limit: 1000
+      local_search_scalarization_weights: [1.0]
+
+    # evolutionary search options
+    evolutionary_optimization:
+      evolution_population_size: 50
+      evolution_generations: 200
+      mutation_rate: 2
+      batch_size: 3
+      evolution_crossover: True
+      regularize_evolution: True

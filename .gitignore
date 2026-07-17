@@ -1,0 +1,13 @@
+# Local artifact data and external checkouts
+dataset/
+hypermapper-src/
+
+# Generated run outputs
+logs/
+results/
+models/
+
+# Local Python environment and caches
+.venv/
+__pycache__/
+*.py[cod]

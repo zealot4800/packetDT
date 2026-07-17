@@ -1,0 +1,9 @@
+numpy
+pandas==1.5.3
+PyYAML
+scikit-learn
+tqdm
+joblib==1.1.0
+
+# Local HyperMapper checkout linked from the original artifact.
+-e ./hypermapper-src
