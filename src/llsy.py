@@ -6,24 +6,33 @@ from pathlib import Path
 import pandas as pd
 
 from .config import ExperimentConfig
-from .data import load_full_flow_dataset
-from .resources import TargetProfile, estimate_leo_resources
+from .data import load_packet_dataset
+from .resources import TargetProfile, estimate_llsy_resources
 from .tree import ModelResult, calculate_macro_f1, fit_tree, select_top_k_features
 
 
-class LEO:
+class LLSY:
     def __init__(self, config: ExperimentConfig):
         self.config = config
 
     def run(self, output_dir: Path) -> ModelResult:
-        split = load_full_flow_dataset(self.config.dataset)
-        selected = select_top_k_features(split.X_train, split.y_train, self.config.leo.max_features, self.config.seed)
-        model = fit_tree(split.X_train[selected], split.y_train, self.config.leo.max_depth, self.config.seed)
+        split = load_packet_dataset(self.config.dataset, self.config.llsy.packet_index)
+        selected = select_top_k_features(
+            split.X_train,
+            split.y_train,
+            self.config.llsy.max_features,
+            self.config.seed,
+        )
+        model = fit_tree(split.X_train[selected], split.y_train, self.config.llsy.max_depth, self.config.seed)
         predictions = model.predict(split.X_test[selected])
         macro_f1 = calculate_macro_f1(split.y_test, predictions)
-        resources = estimate_leo_resources(TargetProfile.from_config(self.config.target), len(selected), model.tree_.node_count)
+        resources = estimate_llsy_resources(
+            TargetProfile.from_config(self.config.target),
+            len(selected),
+            model.tree_.node_count,
+        )
         result = ModelResult(
-            model="LEO",
+            model="LLSY",
             dataset=self.config.dataset.name,
             target=self.config.target.name,
             macro_f1=macro_f1,
@@ -63,5 +72,5 @@ def _remove_resource_csv(output_dir: Path) -> None:
         resource_path.unlink()
 
 
-def run_leo(config: ExperimentConfig, output_dir: Path) -> ModelResult:
-    return LEO(config).run(output_dir)
+def run_llsy(config: ExperimentConfig, output_dir: Path) -> ModelResult:
+    return LLSY(config).run(output_dir)

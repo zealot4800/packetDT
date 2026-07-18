@@ -1,13 +1,11 @@
-# Local artifact data and external checkouts
+.agents/*
+.codex/*
 dataset/
-hypermapper-src/
-
-# Generated run outputs
 logs/
 results/
 models/
-
-# Local Python environment and caches
 .venv/
 __pycache__/
 *.py[cod]
+.DS_Store
+paper/*

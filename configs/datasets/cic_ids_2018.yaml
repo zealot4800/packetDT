@@ -1,0 +1,50 @@
+dataset:
+  name: "CIC-IDS-2018-PCAPS1-f10"
+  root: "dataset"
+  label_column: "Label"
+  flow_id_column: "Flow ID"
+  window_column: "Window"
+  phase_column: "Phase"
+  packet_column: "Packet"
+  full_flow_file: "dataset_df_p1.pkl"
+  partition_file_pattern: "dataset_df_p{num_partitions}.pkl"
+  phase_file: "dataset_df_p1024.pkl"
+  packet_file: "dataset_df_p0.pkl"
+
+experiment:
+  seed: 42
+  target: "tofino1"
+
+splidt:
+  max_depth: 15
+  features_per_partition: 4
+  partition_sizes: [4, 4, 4, 3]
+
+llsy:
+  max_depth: 15
+  max_features: 7
+  packet_index: 0
+
+netbeacon:
+  max_depth: 15
+  max_features: 7
+  phases: [2, 4, 8, 16, 32]
+
+leo:
+  max_depth: 15
+  max_features: 7
+
+statedt:
+  max_depth: 15
+  max_features: 7
+  feature_selection:
+    stateful_only: true
+    explicit_features: []
+  state:
+    fingerprint_bits: 16
+    generation_bits: 4
+    valid_bits: 1
+    allocator: "two_choice"
+  scaling:
+    requested_flows: [10000, 50000, 100000, 250000, 500000, 750000, 1000000]
+  fallback: "majority_class"

@@ -1,0 +1,11 @@
+target: "tofino1"
+tofino1:
+  feature_width: 32
+  node_id_width: 16
+  num_ma_units: 12
+  bookkeeping_stages: 1
+  iat_bookkeeping_stages: 1
+  tcam_capacity_mb: 6.2
+  state_memory_mb: 6.2
+  resubmission_bits_per_pkt: 48
+  resubmission_bw_Gbps: 10
