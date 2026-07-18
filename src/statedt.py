@@ -102,7 +102,10 @@ class StateDT:
 
     def predict_compiled(self, compiled: CompiledStateDT, sample: pd.Series) -> tuple[Any, list[int]]:
         states = {
-            feature: encode_value(float(sample[feature]), spec.thresholds)
+            # sklearn's tree predictor converts input features to float32 before
+            # comparing them with the tree's float64 thresholds. Mirror that
+            # conversion so values near a threshold take the identical branch.
+            feature: encode_value(float(np.float32(sample[feature])), spec.thresholds)
             for feature, spec in compiled.feature_specs.items()
         }
         nodes = {node["node_id"]: node for node in compiled.tree["nodes"]}
