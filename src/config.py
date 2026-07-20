@@ -69,6 +69,14 @@ class NetBeaconConfig(BasicTreeConfig):
 
 
 @dataclass(frozen=True)
+class AdaFlowConfig(BasicTreeConfig):
+    trigger_packet: int
+    phase_delta: int
+    num_dense_phases: int
+    determination_threshold: float
+
+
+@dataclass(frozen=True)
 class StateDTConfig(BasicTreeConfig):
     stateful_only: bool
     explicit_features: tuple[str, ...]
@@ -89,6 +97,7 @@ class ExperimentConfig:
     splidt: SpliDTConfig
     llsy: LLSYConfig
     netbeacon: NetBeaconConfig
+    adaflow: AdaFlowConfig
     leo: BasicTreeConfig
     statedt: StateDTConfig
 
@@ -177,7 +186,7 @@ def _basic(raw: dict[str, Any], section: str) -> BasicTreeConfig:
 def load_experiment_config(path: str) -> ExperimentConfig:
     config_path = Path(path)
     raw = _read_yaml(config_path)
-    for section in ["dataset", "experiment", "splidt", "llsy", "netbeacon", "leo", "statedt"]:
+    for section in ["dataset", "experiment", "splidt", "llsy", "netbeacon", "adaflow", "leo", "statedt"]:
         if section not in raw:
             raise ValueError(f"config missing required section: {section}")
 
@@ -214,6 +223,19 @@ def load_experiment_config(path: str) -> ExperimentConfig:
         phases=phases,
     )
 
+    adaflow_raw = raw["adaflow"] or {}
+    determination_threshold = float(adaflow_raw.get("determination_threshold", 0.8))
+    if not 0 < determination_threshold <= 1:
+        raise ValueError("adaflow.determination_threshold must be in (0, 1]")
+    adaflow = AdaFlowConfig(
+        max_depth=_positive_int(adaflow_raw.get("max_depth"), "adaflow.max_depth"),
+        max_features=_positive_int(adaflow_raw.get("max_features"), "adaflow.max_features"),
+        trigger_packet=_positive_int(adaflow_raw.get("trigger_packet"), "adaflow.trigger_packet"),
+        phase_delta=_positive_int(adaflow_raw.get("phase_delta"), "adaflow.phase_delta"),
+        num_dense_phases=_positive_int(adaflow_raw.get("num_dense_phases"), "adaflow.num_dense_phases"),
+        determination_threshold=determination_threshold,
+    )
+
     statedt_raw = raw["statedt"] or {}
     selection = statedt_raw.get("feature_selection") or {}
     state = statedt_raw.get("state") or {}
@@ -243,6 +265,7 @@ def load_experiment_config(path: str) -> ExperimentConfig:
         splidt=splidt,
         llsy=llsy,
         netbeacon=netbeacon,
+        adaflow=adaflow,
         leo=_basic(raw["leo"] or {}, "leo"),
         statedt=statedt,
     )

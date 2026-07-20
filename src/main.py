@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable
 
 from .config import ExperimentConfig, load_experiment_config
+from .adaflow import run_adaflow
 from .degradation import run_flow_count_metrics
 from .leo import run_leo
 from .llsy import run_llsy
@@ -20,15 +21,17 @@ RUNNERS: dict[str, Runner] = {
     "llsy": run_llsy,
     "iisy": run_llsy,
     "netbeacon": run_netbeacon,
+    "adaflow": run_adaflow,
     "leo": run_leo,
     "statedt": run_statedt,
 }
 
-MODEL_ORDER = ["splidt", "llsy", "netbeacon", "leo", "statedt"]
+MODEL_ORDER = ["splidt", "llsy", "netbeacon", "adaflow", "leo", "statedt"]
 MODEL_LABELS = {
     "splidt": "SpliDT",
     "llsy": "LLSY",
     "netbeacon": "NetBeacon",
+    "adaflow": "AdaFlow",
     "leo": "LEO",
     "statedt": "StateDT",
 }
@@ -51,7 +54,7 @@ def run_one(command: str, config: ExperimentConfig) -> ModelResult:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["splidt", "llsy", "iisy", "netbeacon", "leo", "statedt", "degradation", "all", "example"])
+    parser.add_argument("command", choices=["splidt", "llsy", "iisy", "netbeacon", "adaflow", "leo", "statedt", "degradation", "all", "example"])
     parser.add_argument("--config", default="configs/datasets/cic_ids_2017.yaml")
     args = parser.parse_args()
 

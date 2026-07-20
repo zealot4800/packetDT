@@ -57,11 +57,11 @@ def create_decision_tree(max_depth: int, seed: int) -> DecisionTreeClassifier:
     )
 
 
-def fit_tree(X_train: pd.DataFrame, y_train: pd.Series, max_depth: int, seed: int) -> DecisionTreeClassifier:
+def fit_tree(X_train: pd.DataFrame, y_train: pd.Series, max_depth: int, seed: int, sample_weight=None) -> DecisionTreeClassifier:
     if X_train.empty:
         raise ValueError("cannot train decision tree with an empty feature matrix")
     model = create_decision_tree(max_depth, seed)
-    model.fit(X_train, y_train)
+    model.fit(X_train, y_train, sample_weight=sample_weight)
     return model
 
 

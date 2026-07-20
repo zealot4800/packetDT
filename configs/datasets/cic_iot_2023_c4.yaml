@@ -30,6 +30,14 @@ netbeacon:
   max_features: 7
   phases: [2, 4, 8, 16, 32]
 
+adaflow:
+  max_depth: 15
+  max_features: 7
+  trigger_packet: 4
+  phase_delta: 2
+  num_dense_phases: 15
+  determination_threshold: 0.8
+
 leo:
   max_depth: 15
   max_features: 7

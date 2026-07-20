@@ -17,6 +17,7 @@ class DatasetSplit:
     y_test: pd.Series
     train_flow_ids: pd.Series | None = None
     test_flow_ids: pd.Series | None = None
+    train_sample_weights: pd.Series | None = None
 
 
 @dataclass
@@ -138,6 +139,70 @@ def load_phase_dataset(dataset: DatasetConfig, phases: tuple[int, ...]) -> Datas
         dataset,
         [dataset.flow_id_column, dataset.window_column, dataset.phase_column, dataset.packet_column],
     )
+
+
+def load_adaflow_dataset(
+    dataset: DatasetConfig,
+    trigger_packet: int,
+    phase_delta: int,
+    num_dense_phases: int,
+) -> tuple[DatasetSplit, tuple[int, ...]]:
+    """Build PL-only early samples and FL-only dense samples (Algorithm 1)."""
+    packet_data = _read_processed_pickle(_dataset_file(dataset, dataset.packet_file))
+    phase_data = _read_processed_pickle(_dataset_file(dataset, dataset.phase_file))
+    phase_col = dataset.phase_column if dataset.phase_column in phase_data["ungrouped_train_df"] else dataset.window_column
+    for key in ["ungrouped_train_df", "ungrouped_test_df"]:
+        _require_columns(phase_data[key], [phase_col, dataset.label_column], f"{dataset.phase_file}:{key}")
+        _require_columns(packet_data[key], [dataset.label_column], f"{dataset.packet_file}:{key}")
+
+    dense = {trigger_packet + index * phase_delta for index in range(num_dense_phases)}
+    max_dense = max(dense)
+    powers = {2**index for index in range(max_dense.bit_length()) if 2**index <= max_dense}
+    early = set(range(1, trigger_packet))
+    requested = tuple(sorted(early | dense | powers))
+    train_available = set(phase_data["ungrouped_train_df"][phase_col].dropna().astype(int).unique())
+    test_available = set(phase_data["ungrouped_test_df"][phase_col].dropna().astype(int).unique())
+    available = train_available & test_available
+    phases = tuple(phase for phase in requested if phase in available)
+    if not phases:
+        raise ValueError(f"none of the configured AdaFlow phases are present in {dataset.phase_file}")
+
+    metadata = {dataset.label_column, dataset.flow_id_column, dataset.window_column, dataset.phase_column, dataset.packet_column, "Packet ID"}
+
+    def aggregate(key: str) -> pd.DataFrame:
+        packet_df = packet_data[key].copy()
+        packet_position = dataset.packet_column if dataset.packet_column in packet_df else None
+        if packet_position:
+            packet_df = packet_df[packet_df[packet_position] < trigger_packet].copy()
+        packet_features = [column for column in packet_df if column not in metadata]
+        packet_df = packet_df.rename(columns={column: f"pl::{column}" for column in packet_features})
+        packet_df["__adaflow_phase"] = packet_df[packet_position] if packet_position else 1
+        packet_df["__adaflow_weight"] = 1.0
+
+        flow_df = phase_data[key][phase_data[key][phase_col].isin(phases) & (phase_data[key][phase_col] >= trigger_packet)].copy()
+        flow_features = [column for column in flow_df if column not in metadata]
+        flow_df = flow_df.rename(columns={column: f"fl::{column}" for column in flow_features})
+        flow_df["__adaflow_phase"] = flow_df[phase_col]
+        flow_df["__adaflow_weight"] = flow_df[phase_col].map(
+            lambda phase: max(1.0, trigger_packet * float(np.exp(float(phase) / trigger_packet - 1.0)))
+        )
+        combined = pd.concat([packet_df, flow_df], ignore_index=True, sort=False)
+        feature_columns = [column for column in combined if column.startswith(("pl::", "fl::"))]
+        # Phi in Algorithm 1: a value deliberately outside attainable feature ranges.
+        combined[feature_columns] = combined[feature_columns].fillna(-1.0e30)
+        return combined
+
+    train_df = aggregate("ungrouped_train_df")
+    test_df = aggregate("ungrouped_test_df")
+    raw_weights = train_df["__adaflow_weight"].reset_index(drop=True)
+    split = prepare_features_and_labels(
+        train_df,
+        test_df,
+        dataset,
+        [dataset.flow_id_column, dataset.window_column, dataset.phase_column, dataset.packet_column, "Packet ID", "__adaflow_phase", "__adaflow_weight"],
+    )
+    split.train_sample_weights = raw_weights
+    return split, phases
 
 
 def load_packet_dataset(dataset: DatasetConfig, packet_index: int) -> DatasetSplit:

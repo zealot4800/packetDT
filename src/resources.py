@@ -170,6 +170,15 @@ def estimate_netbeacon_resources(target: TargetProfile, num_features: int, tree_
     return _tree_report(target, num_features, tree_entries, extra_stages=state_update_stages(num_features, target), state_bits=state_bits, metadata_bits=1)
 
 
+def estimate_adaflow_resources(target: TargetProfile, num_features: int, tree_entries: int, max_phase: int) -> ResourceReport:
+    # One aggregated tree, flow features, packet counter, and PrioritySketch bit.
+    counter_bits = max(1, math.ceil(math.log2(max_phase + 1)))
+    state_bits = num_features * target.feature_width + counter_bits
+    metadata_bits = 1  # PrioritySketch's per-flow priority flag.
+    extra_stages = target.bookkeeping_stages + state_update_stages(num_features, target)
+    return _tree_report(target, num_features, tree_entries, extra_stages=extra_stages, state_bits=state_bits, metadata_bits=metadata_bits)
+
+
 def estimate_leo_resources(target: TargetProfile, num_features: int, tree_entries: int) -> ResourceReport:
     state_bits = num_features * target.feature_width
     return _tree_report(target, num_features, tree_entries, extra_stages=state_update_stages(num_features, target), state_bits=state_bits, metadata_bits=1)
