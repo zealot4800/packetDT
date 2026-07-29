@@ -55,10 +55,13 @@ def prepare_features_and_labels(
     test_df: pd.DataFrame,
     dataset: DatasetConfig,
     metadata_columns: list[str],
+    train_sample_weights: pd.Series | None = None,
 ) -> DatasetSplit:
     label = dataset.label_column
     train_df = train_df.reset_index(drop=True)
     test_df = test_df.reset_index(drop=True)
+    if train_sample_weights is not None and len(train_sample_weights) != len(train_df):
+        raise ValueError("training sample weights must match the training dataframe")
     _require_columns(train_df, [label], "training dataframe")
     _require_columns(test_df, [label], "test dataframe")
 
@@ -70,9 +73,19 @@ def prepare_features_and_labels(
     X_train = train_df.drop(columns=drop_columns, errors="ignore")
     X_test = test_df.drop(columns=drop_columns, errors="ignore").reindex(columns=X_train.columns)
 
-    for frame in [X_train, X_test]:
-        for column in frame.select_dtypes(include=["object"]).columns:
-            frame[column] = pd.factorize(frame[column])[0]
+    categorical_columns = X_train.select_dtypes(
+        include=["object", "category", "string"]
+    ).columns
+    for column in categorical_columns:
+        train_values = X_train[column].astype("object")
+        test_values = X_test[column].astype("object")
+        categories = pd.unique(train_values.dropna())
+        category_ids = {value: index for index, value in enumerate(categories)}
+        X_train[column] = train_values.map(category_ids)
+        encoded_test = test_values.map(category_ids)
+        # Keep missing values invalid, but give previously unseen test categories
+        # a stable sentinel instead of independently renumbering all categories.
+        X_test[column] = encoded_test.where(test_values.isna() | encoded_test.notna(), -1)
 
     X_train = X_train.replace([np.inf, -np.inf], np.nan)
     X_test = X_test.replace([np.inf, -np.inf], np.nan)
@@ -90,6 +103,11 @@ def prepare_features_and_labels(
         y_test=y_test.loc[test_good].reset_index(drop=True),
         train_flow_ids=train_flow_ids.loc[train_good].reset_index(drop=True) if train_flow_ids is not None else None,
         test_flow_ids=test_flow_ids.loc[test_good].reset_index(drop=True) if test_flow_ids is not None else None,
+        train_sample_weights=(
+            train_sample_weights.reset_index(drop=True).loc[train_good].reset_index(drop=True)
+            if train_sample_weights is not None
+            else None
+        ),
     )
 
 
@@ -200,8 +218,8 @@ def load_adaflow_dataset(
         test_df,
         dataset,
         [dataset.flow_id_column, dataset.window_column, dataset.phase_column, dataset.packet_column, "Packet ID", "__adaflow_phase", "__adaflow_weight"],
+        train_sample_weights=raw_weights,
     )
-    split.train_sample_weights = raw_weights
     return split, phases
 
 
@@ -213,14 +231,19 @@ def load_packet_dataset(dataset: DatasetConfig, packet_index: int) -> DatasetSpl
         filtered_train = train_df[train_df[dataset.packet_column] == packet_index].copy()
         filtered_test = test_df[test_df[dataset.packet_column] == packet_index].copy()
         if filtered_train.empty or filtered_test.empty:
-            first_train_packet = train_df[dataset.packet_column].min()
-            first_test_packet = test_df[dataset.packet_column].min()
+            common_packets = sorted(
+                set(train_df[dataset.packet_column].dropna().unique())
+                & set(test_df[dataset.packet_column].dropna().unique())
+            )
+            if not common_packets:
+                raise ValueError("packet dataset has no packet index shared by train and test")
+            first_packet = common_packets[0]
             print(
                 f"Packet index {packet_index} is unavailable; using first observed "
-                f"packet indexes train={first_train_packet}, test={first_test_packet}."
+                f"common packet index {first_packet}."
             )
-            filtered_train = train_df[train_df[dataset.packet_column] == first_train_packet].copy()
-            filtered_test = test_df[test_df[dataset.packet_column] == first_test_packet].copy()
+            filtered_train = train_df[train_df[dataset.packet_column] == first_packet].copy()
+            filtered_test = test_df[test_df[dataset.packet_column] == first_packet].copy()
         train_df = filtered_train
         test_df = filtered_test
     return prepare_features_and_labels(

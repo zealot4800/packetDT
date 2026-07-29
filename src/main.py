@@ -65,7 +65,7 @@ def main() -> None:
     config = load_experiment_config(args.config)
     if args.command == "degradation":
         output_paths = run_flow_count_metrics(config)
-        print("Saved flow-count F1 metrics to:")
+        print("Saved validated evaluation and flow-scaling metrics to:")
         for output_path in output_paths:
             print(output_path)
         return

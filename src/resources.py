@@ -46,6 +46,9 @@ class ResourceReport:
     aligned_entry_bits: int | None = None
     register_words_per_flow: int | None = None
     estimated_flow_capacity: int | None = None
+    within_tcam_capacity: bool = True
+    within_stage_budget: bool = True
+    target_feasible: bool = True
 
 
 def allocated_tcam_entries(entries: int, key_width_bits: int, target: TargetProfile) -> int:
@@ -61,7 +64,8 @@ def tcam_stage_count(entries: int, key_width_bits: int, target: TargetProfile) -
 
 
 def tcam_block_count(entries: int, key_width_bits: int, target: TargetProfile) -> int:
-    return tcam_stage_count(entries, key_width_bits, target) * target.tcam_blocks_per_stage
+    allocated = allocated_tcam_entries(entries, key_width_bits, target)
+    return math.ceil(allocated / target.tcam_entries_per_block)
 
 
 def tcam_memory_bits(entries: int, key_width_bits: int, target: TargetProfile) -> int:
@@ -70,10 +74,6 @@ def tcam_memory_bits(entries: int, key_width_bits: int, target: TargetProfile) -
 
 def aligned_register_entry_bits(logical_bits: int, word_bits: int = 32) -> int:
     return max(word_bits, math.ceil(logical_bits / word_bits) * word_bits)
-
-
-def alignment_overhead(logical_bits: int, aligned_bits: int) -> int:
-    return aligned_bits - logical_bits
 
 
 def register_words_per_flow(aligned_bits: int, target: TargetProfile) -> int:
@@ -101,12 +101,16 @@ def _tree_report(
     feature_stages = tcam_stage_count(feature_entries, key_width, target) if feature_entries else 0
     tree_stages = tcam_stage_count(max(1, tree_entries), key_width, target)
     stages = feature_stages + tree_stages + extra_stages
-    blocks = (feature_stages + tree_stages) * target.tcam_blocks_per_stage
+    blocks = tcam_block_count(max(1, tree_entries), key_width, target)
+    if feature_entries:
+        blocks += tcam_block_count(feature_entries, key_width, target)
     tcam_bits = 0
     if feature_entries:
         tcam_bits += tcam_memory_bits(feature_entries, key_width, target)
     tcam_bits += tcam_memory_bits(max(1, tree_entries), key_width, target)
     tcam_memory_mb = tcam_bits / BITS_PER_MB
+    within_tcam_capacity = tcam_memory_mb <= target.tcam_capacity_mb
+    within_stage_budget = stages <= target.num_ma_units
     logical_bits = None
     aligned_bits = None
     words = None
@@ -130,6 +134,9 @@ def _tree_report(
         aligned_entry_bits=aligned_bits,
         register_words_per_flow=words,
         estimated_flow_capacity=capacity,
+        within_tcam_capacity=within_tcam_capacity,
+        within_stage_budget=within_stage_budget,
+        target_feasible=within_tcam_capacity and within_stage_budget,
     )
 
 

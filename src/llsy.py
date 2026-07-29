@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import pickle
 from pathlib import Path
-
-import pandas as pd
 
 from .config import ExperimentConfig
 from .data import load_packet_dataset
 from .resources import TargetProfile, estimate_llsy_resources
-from .tree import ModelResult, calculate_macro_f1, fit_tree, select_top_k_features
+from .tree import ModelResult, calculate_macro_f1, fit_tree, save_model_artifacts, select_top_k_features
 
 
 class LLSY:
@@ -31,45 +28,19 @@ class LLSY:
             len(selected),
             model.tree_.node_count,
         )
-        result = ModelResult(
+        result = ModelResult.from_resources(
             model="LLSY",
             dataset=self.config.dataset.name,
             target=self.config.target.name,
+            seed=self.config.seed,
             macro_f1=macro_f1,
             max_depth=model.get_depth(),
             num_features=len(selected),
-            num_partitions=1,
-            feature_state_bits=resources.feature_state_bits,
-            metadata_bits=resources.metadata_bits,
-            logical_entry_bits=resources.logical_entry_bits,
-            aligned_entry_bits=resources.aligned_entry_bits,
-            estimated_flow_capacity=resources.estimated_flow_capacity,
-            feature_table_entries=resources.feature_table_entries,
-            tree_table_entries=resources.tree_table_entries,
-            total_table_entries=resources.total_table_entries,
-            tcam_blocks=resources.tcam_blocks,
-            tcam_stages=resources.tcam_stages,
-            tcam_capacity_mb=resources.tcam_capacity_mb,
-            tcam_memory_mb=resources.tcam_memory_mb,
-            register_words_per_flow=resources.register_words_per_flow,
+            test_samples=len(split.y_test),
+            resources=resources,
         )
-        save_model_outputs(output_dir, result, {"model": model, "features": selected})
+        save_model_artifacts(output_dir, result, {"model": model, "features": selected})
         return result
-
-
-def save_model_outputs(output_dir: Path, result: ModelResult, model_payload) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([result.metrics_row()]).to_csv(output_dir / "metrics.csv", index=False)
-    _remove_resource_csv(output_dir)
-    (output_dir / "summary.json").unlink(missing_ok=True)
-    with open(output_dir / "model.pkl", "wb") as handle:
-        pickle.dump(model_payload, handle)
-
-
-def _remove_resource_csv(output_dir: Path) -> None:
-    resource_path = output_dir / "resource.csv"
-    if resource_path.exists():
-        resource_path.unlink()
 
 
 def run_llsy(config: ExperimentConfig, output_dir: Path) -> ModelResult:

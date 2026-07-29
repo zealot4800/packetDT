@@ -8,4 +8,4 @@ tofino1:
   tcam_capacity_mb: 6.2
   state_memory_mb: 6.2
   resubmission_bits_per_pkt: 48
-  resubmission_bw_Gbps: 10
+  resubmission_bw_gbps: 10

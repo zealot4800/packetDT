@@ -14,6 +14,10 @@ dataset:
 experiment:
   seed: 42
   target: "tofino1"
+  target_config: "../targets/tofino.yaml"
+
+scaling:
+  requested_flows: [10000, 50000, 100000, 250000, 500000, 750000, 1000000]
 
 splidt:
   max_depth: 15
@@ -23,7 +27,7 @@ splidt:
 llsy:
   max_depth: 15
   max_features: 7
-  packet_index: 0
+  packet_index: 1
 
 netbeacon:
   max_depth: 15
@@ -48,11 +52,12 @@ statedt:
   feature_selection:
     stateful_only: true
     explicit_features: []
+    scaling_aware: true
+    validation_folds: 3
+    max_f1_drop: 0.02
   state:
     fingerprint_bits: 16
     generation_bits: 4
     valid_bits: 1
     allocator: "two_choice"
-  scaling:
-    requested_flows: [10000, 50000, 100000, 250000, 500000, 750000, 1000000]
   fallback: "majority_class"

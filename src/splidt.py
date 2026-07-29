@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import pickle
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -11,7 +10,7 @@ from sklearn.tree import DecisionTreeClassifier
 from .config import ExperimentConfig
 from .data import DatasetSplit, load_partition_dataset, split_window_dataset
 from .resources import TargetProfile, estimate_splidt_resources
-from .tree import ModelResult, calculate_macro_f1
+from .tree import ModelResult, calculate_macro_f1, save_model_artifacts
 
 
 @dataclass
@@ -23,25 +22,42 @@ class PartitionSubtree:
     partition_depth: int
     children: dict[int, "PartitionSubtree"] = field(default_factory=dict)
 
-    def route(self, row: pd.Series) -> tuple[int, object, bool]:
-        """Traverse this partition, returning boundary node, prediction, and leaf flag."""
+    def _route_values(self, values: np.ndarray) -> tuple[int, object, bool]:
         tree = self.model.tree_
+        children_left = tree.children_left
+        children_right = tree.children_right
+        feature_indices = tree.feature
+        thresholds = tree.threshold
+        node_values = tree.value
         node = 0
         decisions = 0
-        values = row[self.features]
-        while tree.children_left[node] != tree.children_right[node]:
+        while children_left[node] != children_right[node]:
             if decisions == self.partition_depth:
                 break
-            feature = self.features[int(tree.feature[node])]
+            feature_index = int(feature_indices[node])
             node = int(
-                tree.children_left[node]
-                if values[feature] <= tree.threshold[node]
-                else tree.children_right[node]
+                children_left[node]
+                if values[feature_index] <= thresholds[node]
+                else children_right[node]
             )
+            if not 0 <= node < tree.node_count:
+                raise RuntimeError(f"decision tree routed to invalid node {node}")
             decisions += 1
-        prediction = self.model.classes_[tree.value[node][0].argmax()]
-        is_leaf = tree.children_left[node] == tree.children_right[node]
+        prediction = self.model.classes_[node_values[node][0].argmax()]
+        is_leaf = children_left[node] == children_right[node]
         return node, prediction, bool(is_leaf)
+
+    def route(self, row: pd.Series) -> tuple[int, object, bool]:
+        """Traverse this partition, returning boundary node, prediction, and leaf flag."""
+        return self._route_values(row.loc[self.features].to_numpy())
+
+    def route_array(
+        self,
+        row: np.ndarray,
+        column_positions: dict[str, int],
+    ) -> tuple[int, object, bool]:
+        values = np.asarray([row[column_positions[feature]] for feature in self.features])
+        return self._route_values(values)
 
     def deployed_node_count(self) -> int:
         tree = self.model.tree_
@@ -80,7 +96,6 @@ class SpliDT:
         partition_index: int,
         flow_ids: list[str],
         remaining_depth: int,
-        seed_offset: int,
     ) -> PartitionSubtree | None:
         split = windows[partition_index]
         if split.train_flow_ids is None:
@@ -111,17 +126,21 @@ class SpliDT:
             return subtree
 
         routed: dict[int, list[str]] = {}
+        training_values = X_train.to_numpy(copy=False)
+        column_positions = {column: index for index, column in enumerate(X_train.columns)}
         for row_index, flow_id in enumerate(aligned_flow_ids):
-            boundary_node, _, is_leaf = subtree.route(X_train.iloc[row_index])
+            boundary_node, _, is_leaf = subtree.route_array(
+                training_values[row_index],
+                column_positions,
+            )
             if not is_leaf:
                 routed.setdefault(boundary_node, []).append(flow_id)
-        for child_number, (boundary_node, child_flows) in enumerate(sorted(routed.items())):
+        for boundary_node, child_flows in sorted(routed.items()):
             child = self._fit_subtree(
                 windows,
                 partition_index + 1,
                 child_flows,
                 remaining_depth - partition_depth,
-                seed_offset * 1000 + child_number + 1,
             )
             if child is not None:
                 subtree.children[boundary_node] = child
@@ -131,20 +150,29 @@ class SpliDT:
     def _predict(root: PartitionSubtree, windows: list[DatasetSplit]) -> tuple[pd.Series, np.ndarray]:
         if windows[0].test_flow_ids is None:
             raise ValueError("SpliDT requires Flow ID values for routed partition inference")
-        window_rows = [
-            {flow_id: row for flow_id, (_, row) in zip(split.test_flow_ids, split.X_test.iterrows())}
-            for split in windows
-        ]
+        window_rows = []
+        for split in windows:
+            if split.test_flow_ids is None:
+                raise ValueError("SpliDT requires Flow ID values for every inference window")
+            positions = {
+                flow_id: position for position, flow_id in enumerate(split.test_flow_ids)
+            }
+            values = split.X_test.to_numpy(copy=False)
+            columns = {column: index for index, column in enumerate(split.X_test.columns)}
+            window_rows.append((positions, values, columns))
         predictions = []
         valid_positions = []
         for position, flow_id in enumerate(windows[0].test_flow_ids):
             subtree = root
             prediction = None
-            for partition_index, rows in enumerate(window_rows):
-                row = rows.get(flow_id)
-                if row is None:
+            for positions, values, columns in window_rows:
+                row_position = positions.get(flow_id)
+                if row_position is None:
                     break
-                boundary_node, prediction, is_leaf = subtree.route(row)
+                boundary_node, prediction, is_leaf = subtree.route_array(
+                    values[row_position],
+                    columns,
+                )
                 if is_leaf or boundary_node not in subtree.children:
                     break
                 subtree = subtree.children[boundary_node]
@@ -163,7 +191,7 @@ class SpliDT:
         root_ids = windows[0].train_flow_ids
         if root_ids is None:
             raise ValueError("SpliDT training data has no Flow ID column")
-        root = self._fit_subtree(windows, 0, root_ids.tolist(), self.config.splidt.max_depth, 1)
+        root = self._fit_subtree(windows, 0, root_ids.tolist(), self.config.splidt.max_depth)
         if root is None:
             raise ValueError("SpliDT did not train a root subtree")
 
@@ -183,45 +211,20 @@ class SpliDT:
             feature_entries,
             tree_entries,
         )
-        result = ModelResult(
+        result = ModelResult.from_resources(
             model="SpliDT",
             dataset=self.config.dataset.name,
             target=self.config.target.name,
+            seed=self.config.seed,
             macro_f1=macro_f1,
             max_depth=self.config.splidt.max_depth,
             num_features=len(set(feature for features in selected_by_subtree for feature in features)),
+            test_samples=len(y_test),
             num_partitions=partition_count,
-            feature_state_bits=resources.feature_state_bits,
-            metadata_bits=resources.metadata_bits,
-            logical_entry_bits=resources.logical_entry_bits,
-            aligned_entry_bits=resources.aligned_entry_bits,
-            estimated_flow_capacity=resources.estimated_flow_capacity,
-            feature_table_entries=resources.feature_table_entries,
-            tree_table_entries=resources.tree_table_entries,
-            total_table_entries=resources.total_table_entries,
-            tcam_blocks=resources.tcam_blocks,
-            tcam_stages=resources.tcam_stages,
-            tcam_capacity_mb=resources.tcam_capacity_mb,
-            tcam_memory_mb=resources.tcam_memory_mb,
-            register_words_per_flow=resources.register_words_per_flow,
+            resources=resources,
         )
-        save_model_outputs(output_dir, result, {"root": root, "features": selected_by_subtree})
+        save_model_artifacts(output_dir, result, {"root": root, "features": selected_by_subtree})
         return result
-
-
-def save_model_outputs(output_dir: Path, result: ModelResult, model_payload) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([result.metrics_row()]).to_csv(output_dir / "metrics.csv", index=False)
-    _remove_resource_csv(output_dir)
-    (output_dir / "summary.json").unlink(missing_ok=True)
-    with open(output_dir / "model.pkl", "wb") as handle:
-        pickle.dump(model_payload, handle)
-
-
-def _remove_resource_csv(output_dir: Path) -> None:
-    resource_path = output_dir / "resource.csv"
-    if resource_path.exists():
-        resource_path.unlink()
 
 
 def run_splidt(config: ExperimentConfig, output_dir: Path) -> ModelResult:

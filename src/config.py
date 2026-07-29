@@ -80,12 +80,19 @@ class AdaFlowConfig(BasicTreeConfig):
 class StateDTConfig(BasicTreeConfig):
     stateful_only: bool
     explicit_features: tuple[str, ...]
+    scaling_aware: bool
+    validation_folds: int
+    max_f1_drop: float
     fingerprint_bits: int
     generation_bits: int
     valid_bits: int
     allocator: str
-    requested_flows: tuple[int, ...]
     fallback: str
+
+
+@dataclass(frozen=True)
+class ScalingConfig:
+    requested_flows: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -94,6 +101,7 @@ class ExperimentConfig:
     dataset: DatasetConfig
     target: TargetConfig
     seed: int
+    scaling: ScalingConfig
     splidt: SpliDTConfig
     llsy: LLSYConfig
     netbeacon: NetBeaconConfig
@@ -119,6 +127,12 @@ def _positive_int(value: Any, name: str) -> int:
 def _positive_float(value: Any, name: str) -> float:
     if not isinstance(value, (int, float)) or value <= 0:
         raise ValueError(f"{name} must be a positive number")
+    return float(value)
+
+
+def _bounded_float(value: Any, name: str, minimum: float, maximum: float) -> float:
+    if not isinstance(value, (int, float)) or not minimum <= float(value) <= maximum:
+        raise ValueError(f"{name} must be in [{minimum}, {maximum}]")
     return float(value)
 
 
@@ -172,7 +186,10 @@ def load_target_config(path: str | Path, target_name: str) -> TargetConfig:
         tcam_capacity_mb=_positive_float(target.get("tcam_capacity_mb"), "tcam_capacity_mb"),
         state_memory_mb=_positive_float(target.get("state_memory_mb"), "state_memory_mb"),
         resubmission_bits_per_pkt=_positive_int(target.get("resubmission_bits_per_pkt"), "resubmission_bits_per_pkt"),
-        resubmission_bw_gbps=float(target.get("resubmission_bw_Gbps", target.get("resubmission_bw_gbps", 0))),
+        resubmission_bw_gbps=_positive_float(
+            target.get("resubmission_bw_gbps", target.get("resubmission_bw_Gbps")),
+            "resubmission_bw_gbps",
+        ),
     )
 
 
@@ -186,7 +203,7 @@ def _basic(raw: dict[str, Any], section: str) -> BasicTreeConfig:
 def load_experiment_config(path: str) -> ExperimentConfig:
     config_path = Path(path)
     raw = _read_yaml(config_path)
-    for section in ["dataset", "experiment", "splidt", "llsy", "netbeacon", "adaflow", "leo", "statedt"]:
+    for section in ["dataset", "experiment", "scaling", "splidt", "llsy", "netbeacon", "adaflow", "leo", "statedt"]:
         if section not in raw:
             raise ValueError(f"config missing required section: {section}")
 
@@ -194,7 +211,17 @@ def load_experiment_config(path: str) -> ExperimentConfig:
     experiment = raw["experiment"] or {}
     seed = _positive_int(experiment.get("seed"), "experiment.seed")
     target_name = str(experiment.get("target", ""))
-    target = load_target_config(config_path.parent.parent / "targets" / "tofino.yaml", target_name)
+    target_path = Path(str(experiment.get("target_config", "../targets/tofino.yaml")))
+    if not target_path.is_absolute():
+        target_path = config_path.parent / target_path
+    target = load_target_config(target_path, target_name)
+
+    scaling_raw = raw["scaling"] or {}
+    scaling = ScalingConfig(
+        requested_flows=_positive_int_tuple(scaling_raw.get("requested_flows"), "scaling.requested_flows"),
+    )
+    if tuple(sorted(set(scaling.requested_flows))) != scaling.requested_flows:
+        raise ValueError("scaling.requested_flows must be unique and strictly increasing")
 
     splidt_raw = raw["splidt"] or {}
     partition_sizes = _positive_int_tuple(splidt_raw.get("partition_sizes"), "splidt.partition_sizes")
@@ -239,19 +266,31 @@ def load_experiment_config(path: str) -> ExperimentConfig:
     statedt_raw = raw["statedt"] or {}
     selection = statedt_raw.get("feature_selection") or {}
     state = statedt_raw.get("state") or {}
-    scaling = statedt_raw.get("scaling") or {}
     if state.get("allocator") != "two_choice":
         raise ValueError("statedt.state.allocator must be 'two_choice'")
+    validation_folds = _positive_int(
+        selection.get("validation_folds", 3),
+        "statedt.feature_selection.validation_folds",
+    )
+    if validation_folds < 2:
+        raise ValueError("statedt.feature_selection.validation_folds must be at least 2")
     statedt = StateDTConfig(
         max_depth=_positive_int(statedt_raw.get("max_depth"), "statedt.max_depth"),
         max_features=_positive_int(statedt_raw.get("max_features"), "statedt.max_features"),
         stateful_only=bool(selection.get("stateful_only", True)),
         explicit_features=tuple(str(item) for item in selection.get("explicit_features", []) or []),
+        scaling_aware=bool(selection.get("scaling_aware", True)),
+        validation_folds=validation_folds,
+        max_f1_drop=_bounded_float(
+            selection.get("max_f1_drop", 0.02),
+            "statedt.feature_selection.max_f1_drop",
+            0.0,
+            1.0,
+        ),
         fingerprint_bits=_positive_int(state.get("fingerprint_bits"), "statedt.state.fingerprint_bits"),
         generation_bits=_positive_int(state.get("generation_bits"), "statedt.state.generation_bits"),
         valid_bits=_positive_int(state.get("valid_bits"), "statedt.state.valid_bits"),
         allocator=str(state.get("allocator")),
-        requested_flows=_positive_int_tuple(scaling.get("requested_flows"), "statedt.scaling.requested_flows"),
         fallback=str(statedt_raw.get("fallback", "majority_class")),
     )
     if statedt.fallback not in {"majority_class", "no_prediction"}:
@@ -262,6 +301,7 @@ def load_experiment_config(path: str) -> ExperimentConfig:
         dataset=dataset,
         target=target,
         seed=seed,
+        scaling=scaling,
         splidt=splidt,
         llsy=llsy,
         netbeacon=netbeacon,

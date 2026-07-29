@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import pickle
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -11,14 +13,48 @@ from sklearn.metrics import f1_score
 from sklearn.tree import DecisionTreeClassifier
 
 
+METRICS_COLUMNS = [
+    "dataset",
+    "target",
+    "model",
+    "seed",
+    "scope",
+    "flow_count",
+    "flows_used",
+    "test_samples",
+    "macro_f1",
+    "max_depth",
+    "num_features",
+    "num_partitions",
+    "feature_state_bits",
+    "metadata_bits",
+    "logical_entry_bits",
+    "aligned_entry_bits",
+    "estimated_flow_capacity",
+    "feature_table_entries",
+    "tree_table_entries",
+    "total_table_entries",
+    "tcam_blocks",
+    "tcam_stages",
+    "tcam_capacity_mb",
+    "tcam_memory_mb",
+    "register_words_per_flow",
+    "within_tcam_capacity",
+    "within_stage_budget",
+    "target_feasible",
+]
+
+
 @dataclass
 class ModelResult:
     model: str
     dataset: str
     target: str
+    seed: int
     macro_f1: float | None
     max_depth: int | None
     num_features: int | None
+    test_samples: int | None = None
     num_partitions: int | None = None
     feature_state_bits: int | None = None
     metadata_bits: int | None = None
@@ -33,9 +69,76 @@ class ModelResult:
     tcam_capacity_mb: float | None = None
     tcam_memory_mb: float | None = None
     register_words_per_flow: int | None = None
+    within_tcam_capacity: bool | None = None
+    within_stage_budget: bool | None = None
+    target_feasible: bool | None = None
 
     def metrics_row(self) -> dict[str, Any]:
-        return {key: _clean(value) for key, value in asdict(self).items()}
+        values = {key: _clean(value) for key, value in asdict(self).items()}
+        return {
+            "dataset": values["dataset"],
+            "target": values["target"],
+            "model": values["model"],
+            "seed": values["seed"],
+            "scope": "evaluation",
+            "flow_count": "",
+            "flows_used": "",
+            "test_samples": values["test_samples"],
+            "macro_f1": values["macro_f1"],
+            "max_depth": values["max_depth"],
+            "num_features": values["num_features"],
+            "num_partitions": values["num_partitions"],
+            **{
+                column: values[column]
+                for column in METRICS_COLUMNS
+                if column in values
+                and column
+                not in {
+                    "dataset",
+                    "target",
+                    "model",
+                    "seed",
+                    "test_samples",
+                    "macro_f1",
+                    "max_depth",
+                    "num_features",
+                    "num_partitions",
+                }
+            },
+        }
+
+    @classmethod
+    def from_resources(
+        cls,
+        *,
+        model: str,
+        dataset: str,
+        target: str,
+        seed: int,
+        macro_f1: float,
+        max_depth: int,
+        num_features: int,
+        test_samples: int,
+        resources: Any,
+        num_partitions: int = 1,
+    ) -> "ModelResult":
+        resource_fields = {
+            name: getattr(resources, name)
+            for name in cls.__dataclass_fields__
+            if hasattr(resources, name)
+        }
+        return cls(
+            model=model,
+            dataset=dataset,
+            target=target,
+            seed=seed,
+            macro_f1=macro_f1,
+            max_depth=max_depth,
+            num_features=num_features,
+            test_samples=test_samples,
+            num_partitions=num_partitions,
+            **resource_fields,
+        )
 
 
 def _clean(value: Any) -> Any:
@@ -123,11 +226,6 @@ def calculate_macro_f1(y_true: pd.Series, y_pred: np.ndarray) -> float:
     return float(f1_score(y_true, y_pred, average="macro", zero_division=0))
 
 
-def count_leaf_nodes(model: DecisionTreeClassifier) -> int:
-    tree = model.tree_
-    return int(np.sum(tree.children_left == tree.children_right))
-
-
 def serialize_tree(model: DecisionTreeClassifier, feature_names: list[str]) -> dict[str, Any]:
     return {
         "comparison_semantics": "left: value <= threshold, right: value > threshold",
@@ -137,6 +235,139 @@ def serialize_tree(model: DecisionTreeClassifier, feature_names: list[str]) -> d
     }
 
 
-def write_json(path: str, payload: dict[str, Any]) -> None:
+def write_json(path: str | Path, payload: dict[str, Any]) -> None:
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, default=str)
+
+
+def write_metrics_rows(
+    output_path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    replace_scope: str,
+) -> None:
+    if not rows:
+        return
+    _validate_metrics_rows(rows, expected_scope=replace_scope)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = pd.DataFrame(columns=METRICS_COLUMNS)
+    if output_path.exists():
+        candidate = pd.read_csv(output_path)
+        if list(candidate.columns) == METRICS_COLUMNS:
+            existing = candidate[candidate["scope"] != replace_scope].copy()
+
+    new_rows = pd.DataFrame(rows, columns=METRICS_COLUMNS)
+    combined = pd.concat([existing, new_rows], ignore_index=True)
+    scope_order = combined["scope"].map({"evaluation": 0, "flow_scaling": 1}).fillna(2)
+    combined = (
+        combined.assign(__scope_order=scope_order)
+        .sort_values(["__scope_order", "flow_count"], na_position="first")
+        .drop(columns="__scope_order")
+        .reset_index(drop=True)
+    )
+    _validate_metrics_rows(combined.to_dict("records"))
+
+    temporary_path = output_path.with_suffix(".tmp.csv")
+    combined.to_csv(temporary_path, index=False, encoding="utf-8")
+    temporary_path.replace(output_path)
+    remove_auxiliary_csvs(output_path.parent)
+
+
+def _validate_metrics_rows(
+    rows: list[dict[str, Any]],
+    expected_scope: str | None = None,
+) -> None:
+    for position, row in enumerate(rows, start=1):
+        scope = str(row.get("scope", ""))
+        if scope not in {"evaluation", "flow_scaling"}:
+            raise ValueError(f"metrics row {position} has invalid scope: {scope!r}")
+        if expected_scope is not None and scope != expected_scope:
+            raise ValueError(f"metrics row {position} must use scope {expected_scope!r}")
+        for field in ["dataset", "target", "model"]:
+            if not str(row.get(field, "")).strip():
+                raise ValueError(f"metrics row {position} has no {field}")
+        seed = _required_int(row, "seed", position)
+        if seed <= 0:
+            raise ValueError(f"metrics row {position} seed must be positive")
+        macro_f1 = _required_float(row, "macro_f1", position)
+        if not 0.0 <= macro_f1 <= 1.0:
+            raise ValueError(f"metrics row {position} macro_f1 must be in [0, 1]")
+        for field in ["test_samples", "num_features", "num_partitions"]:
+            if _required_int(row, field, position) <= 0:
+                raise ValueError(f"metrics row {position} {field} must be positive")
+        if _required_int(row, "max_depth", position) < 0:
+            raise ValueError(f"metrics row {position} max_depth cannot be negative")
+        if scope == "flow_scaling":
+            flow_count = _required_int(row, "flow_count", position)
+            flows_used = _required_int(row, "flows_used", position)
+            if flow_count <= 0 or not 0 <= flows_used <= flow_count:
+                raise ValueError(f"metrics row {position} has invalid flow counts")
+        for field in [
+            "feature_table_entries",
+            "tree_table_entries",
+            "total_table_entries",
+            "tcam_blocks",
+            "tcam_stages",
+            "tcam_capacity_mb",
+            "tcam_memory_mb",
+        ]:
+            if _required_float(row, field, position) < 0:
+                raise ValueError(f"metrics row {position} {field} cannot be negative")
+        feature_entries = _required_int(row, "feature_table_entries", position)
+        tree_entries = _required_int(row, "tree_table_entries", position)
+        total_entries = _required_int(row, "total_table_entries", position)
+        if total_entries != feature_entries + tree_entries:
+            raise ValueError(f"metrics row {position} has inconsistent table entries")
+        within_tcam = _required_bool(row, "within_tcam_capacity", position)
+        within_stages = _required_bool(row, "within_stage_budget", position)
+        feasible = _required_bool(row, "target_feasible", position)
+        if feasible != (within_tcam and within_stages):
+            raise ValueError(f"metrics row {position} has inconsistent feasibility flags")
+
+
+def _required_float(row: dict[str, Any], field: str, position: int) -> float:
+    value = row.get(field)
+    if value == "" or value is None or pd.isna(value):
+        raise ValueError(f"metrics row {position} has no {field}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"metrics row {position} {field} must be finite")
+    return number
+
+
+def _required_int(row: dict[str, Any], field: str, position: int) -> int:
+    value = _required_float(row, field, position)
+    if not value.is_integer():
+        raise ValueError(f"metrics row {position} {field} must be an integer")
+    return int(value)
+
+
+def _required_bool(row: dict[str, Any], field: str, position: int) -> bool:
+    value = row.get(field)
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1"}:
+        return True
+    if normalized in {"false", "0"}:
+        return False
+    raise ValueError(f"metrics row {position} {field} must be boolean")
+
+
+def remove_auxiliary_csvs(output_dir: Path) -> None:
+    for path in output_dir.glob("*.csv"):
+        if path.name != "metrics.csv":
+            path.unlink()
+
+
+def save_model_artifacts(output_dir: Path, result: ModelResult, model_payload: Any) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_metrics_rows(
+        output_dir / "metrics.csv",
+        [result.metrics_row()],
+        replace_scope="evaluation",
+    )
+    (output_dir / "summary.json").unlink(missing_ok=True)
+    with open(output_dir / "model.pkl", "wb") as handle:
+        pickle.dump(model_payload, handle)
