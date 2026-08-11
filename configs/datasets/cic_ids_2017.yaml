@@ -1,5 +1,5 @@
 dataset:
-  name: "CIC-IDS-2017-PCAPS1-f10"
+  name: "CIC-IDS-2017"
   root: "dataset"
   label_column: "Label"
   flow_id_column: "Flow ID"

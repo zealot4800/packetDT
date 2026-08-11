@@ -4,6 +4,7 @@ dataset/
 logs/
 results/
 models/
+papers/
 .venv/
 __pycache__/
 *.py[cod]
