@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,10 +18,12 @@ from .scaling import sample_indices, two_choice_allocation
 from .tree import (
     ModelResult,
     calculate_macro_f1,
+    extract_thresholds_by_feature,
     fit_tree,
     predict_with_path,
     save_model_artifacts,
     select_top_k_features,
+    serialize_tree,
 )
 
 
@@ -52,9 +55,57 @@ class EvaluatedStateDT:
     resources: ResourceReport
 
 
+@dataclass(frozen=True)
+class FeatureStateSpec:
+    thresholds: tuple[float, ...]
+    logical_bits: int
+
+
+@dataclass
+class CompiledStateDT:
+    feature_specs: dict[str, FeatureStateSpec]
+    tree: dict[str, Any]
+
+
+def _logical_bits_for_bins(thresholds: tuple[float, ...]) -> int:
+    return 0 if not thresholds else max(1, math.ceil(math.log2(len(thresholds) + 1)))
+
+
+def _encode_value(value: float, thresholds: tuple[float, ...]) -> int:
+    for index, threshold in enumerate(thresholds):
+        if value <= threshold:
+            return index
+    return len(thresholds)
+
+
 class StateDT:
     def __init__(self, config: ExperimentConfig):
         self.config = config
+
+    def compile(self, model, features: list[str]) -> CompiledStateDT:
+        thresholds = extract_thresholds_by_feature(model, features)
+        specs = {
+            feature: FeatureStateSpec(values, _logical_bits_for_bins(values))
+            for feature, values in thresholds.items()
+        }
+        return CompiledStateDT(feature_specs=specs, tree=serialize_tree(model, features))
+
+    def predict_compiled(self, compiled: CompiledStateDT, sample: pd.Series) -> tuple[Any, list[int]]:
+        states = {
+            feature: _encode_value(float(np.float32(sample[feature])), spec.thresholds)
+            for feature, spec in compiled.feature_specs.items()
+        }
+        nodes = {node["node_id"]: node for node in compiled.tree["nodes"]}
+        node_id = 0
+        path = []
+        while True:
+            node = nodes[node_id]
+            path.append(node_id)
+            if node["is_leaf"]:
+                return node["prediction"], path
+            spec = compiled.feature_specs[node["feature"]]
+            threshold_index = spec.thresholds.index(node["threshold"])
+            node_id = node["left_child"] if states[node["feature"]] <= threshold_index else node["right_child"]
 
     def train(self, split) -> TrainedStateDT:
         available_features = list(split.X_train.columns)
