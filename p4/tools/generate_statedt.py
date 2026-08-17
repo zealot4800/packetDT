@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import pickle
 from pathlib import Path
 from typing import Any
 
@@ -29,49 +28,9 @@ P4_NAMES = {
 MAX_P4_VALUE = (1 << 16) - 1
 
 
-def _compiler_from_pickle(path: Path) -> dict[str, Any]:
-    payload = pickle.loads(path.read_bytes())
-    if not isinstance(payload, dict) or "model" not in payload or "features" not in payload:
-        raise ValueError("model pickle must contain 'model' and 'features'")
-    model = payload["model"]
-    features = list(payload["features"])
-    classes = [str(label) for label in model.classes_]
-    tree = model.tree_
-    nodes = []
-    thresholds: dict[str, set[float]] = {feature: set() for feature in features}
-    for node_id in range(tree.node_count):
-        feature_index = int(tree.feature[node_id])
-        is_leaf = feature_index < 0
-        feature = None if is_leaf else features[feature_index]
-        threshold = None if is_leaf else float(tree.threshold[node_id])
-        if feature is not None and threshold is not None:
-            thresholds[feature].add(threshold)
-        prediction = classes[int(tree.value[node_id][0].argmax())]
-        nodes.append(
-            {
-                "node_id": node_id,
-                "feature": feature,
-                "threshold": threshold,
-                "left_child": None if is_leaf else int(tree.children_left[node_id]),
-                "right_child": None if is_leaf else int(tree.children_right[node_id]),
-                "prediction": prediction,
-                "is_leaf": is_leaf,
-            }
-        )
-    return {
-        "model": "StateDT",
-        "features": features,
-        "class_ids": {label: index for index, label in enumerate(classes)},
-        "feature_specs": {
-            feature: {"thresholds": sorted(thresholds[feature])} for feature in features
-        },
-        "tree": {"nodes": nodes},
-    }
-
-
 def _load_compiler(path: Path) -> dict[str, Any]:
-    if path.suffix == ".pkl":
-        return _compiler_from_pickle(path)
+    if path.suffix != ".json":
+        raise ValueError("StateDT P4 generation requires compiler.json")
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -79,10 +38,19 @@ def _caps(compiler: dict[str, Any]) -> dict[str, int]:
     caps: dict[str, int] = {}
     specs = compiler["feature_specs"]
     for feature in P4_FEATURES:
-        thresholds = specs[feature]["thresholds"]
+        spec = specs[feature]
+        thresholds = spec["thresholds"]
         if not thresholds:
             raise ValueError(f"StateDT feature has no thresholds: {feature}")
-        cap = math.floor(max(thresholds)) + 1
+        representation = spec.get("representation")
+        if representation == "threshold_region":
+            cap = int(spec["state_count"]) - 1
+        elif representation == "capped_integer":
+            cap = int(spec["cap"])
+        else:
+            raise ValueError(
+                f"unsupported StateDT representation for {feature}: {representation!r}"
+            )
         if cap > MAX_P4_VALUE:
             raise ValueError(
                 f"StateDT feature '{feature}' needs cap {cap}, above the 16-bit P4 limit"
@@ -111,7 +79,11 @@ def _leaf_ranges(
         if feature not in bounds:
             raise ValueError(f"tree uses unsupported P4 feature: {feature}")
         low, high = bounds[feature]
-        split = math.floor(node["threshold"])
+        spec = compiler["feature_specs"][feature]
+        if spec["representation"] == "threshold_region":
+            split = spec["thresholds"].index(node["threshold"])
+        else:
+            split = math.floor(node["threshold"])
 
         left_high = min(high, split)
         if low <= left_high:
@@ -189,10 +161,24 @@ def _validate_partition(
                 raise ValueError(f"generated leaf ranges overlap: {left_id} and {right_id}")
 
 
+def _max_update_include(compiler: dict[str, Any], feature: str, packet_expr: str) -> str:
+    spec = compiler["feature_specs"][feature]
+    if spec["representation"] != "threshold_region":
+        raise ValueError(f"P4 max feature {feature!r} must use threshold_region")
+    lines = ["incoming_region = 0;"]
+    for index, threshold in enumerate(spec["thresholds"], start=1):
+        lines.append(
+            f"if ({packet_expr} > 16w{math.floor(threshold)}) {{ incoming_region = 16w{index}; }}"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def generate(compiler_path: Path, output_dir: Path) -> tuple[Path, Path, Path, int]:
     compiler = _load_compiler(compiler_path)
     if compiler.get("model") != "StateDT":
         raise ValueError("compiler artifact is not a StateDT model")
+    if compiler.get("compiler") != "decision-sufficient-state":
+        raise ValueError("compiler artifact is not decision-sufficient StateDT")
     if tuple(compiler.get("features", ())) != P4_FEATURES:
         raise ValueError(
             "P4 targets require this exact StateDT feature order: " + ", ".join(P4_FEATURES)
@@ -210,12 +196,18 @@ def generate(compiler_path: Path, output_dir: Path) -> tuple[Path, Path, Path, i
     classes_path.write_text(
         json.dumps(compiler["class_ids"], indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    (output_dir / "statedt_update_packet_max.p4inc").write_text(
+        _max_update_include(compiler, "Packet Length Max", "packet_length"), encoding="utf-8"
+    )
+    (output_dir / "statedt_update_fwd_packet_max.p4inc").write_text(
+        _max_update_include(compiler, "Fwd Packet Length Max", "packet_length"), encoding="utf-8"
+    )
     return model_path, entries_path, classes_path, len(leaves)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate StateDT P4 range-table includes")
-    parser.add_argument("compiler", type=Path, help="StateDT compiler.json or model.pkl")
+    parser.add_argument("compiler", type=Path, help="StateDT compiler.json")
     parser.add_argument(
         "--output-dir", type=Path, default=Path("p4/common"), help="generated include directory"
     )

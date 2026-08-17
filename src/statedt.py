@@ -2,19 +2,22 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import f1_score
-from sklearn.model_selection import KFold, StratifiedKFold
 
 from .config import ExperimentConfig
 from .data import load_full_flow_dataset
-from .resources import ResourceReport, TargetProfile, estimate_statedt_resources
-from .scaling import sample_indices, two_choice_allocation
+from .resources import (
+    ResourceReport,
+    TargetProfile,
+    aligned_register_entry_bits,
+    estimate_statedt_resources,
+    estimated_flow_capacity,
+)
 from .tree import (
     ModelResult,
     calculate_macro_f1,
@@ -24,27 +27,84 @@ from .tree import (
     save_model_artifacts,
     select_top_k_features,
     serialize_tree,
+    write_json,
 )
 
 
+STATEFUL_FEATURES = (
+    "Packet Length Max",
+    "PSH Flag Count",
+    "Total Length of Fwd Packet",
+    "FIN Flag Count",
+    "Fwd Packet Length Max",
+    "Total Bwd packets",
+)
+
+FEATURE_SEMANTICS = {
+    "Packet Length Max": "max",
+    "PSH Flag Count": "counter",
+    "Total Length of Fwd Packet": "sum",
+    "FIN Flag Count": "counter",
+    "Fwd Packet Length Max": "max",
+    "Total Bwd packets": "counter",
+}
+
+SEMANTICS_VERSION = 1
+ORIGINAL_FEATURE_STATE_BITS = 16
+
+
 @dataclass(frozen=True)
-class StateDTCandidate:
-    feature_count: int
-    features: tuple[str, ...]
-    validation_f1: float
-    scaled_validation_f1: float
-    feature_state_bits: int
-    aligned_entry_bits: int
-    estimated_flow_capacity: int
-    eligible: bool = False
-    selected: bool = False
+class FeatureStateSpec:
+    feature: str
+    semantics: str
+    representation: str
+    thresholds: tuple[float, ...]
+    logical_bits: int
+    state_count: int
+    cap: int | None
+
+
+@dataclass
+class CompiledStateDT:
+    feature_specs: dict[str, FeatureStateSpec]
+    tree: dict[str, Any]
+
+    @property
+    def feature_state_bits(self) -> int:
+        return sum(spec.logical_bits for spec in self.feature_specs.values())
+
+    def to_dict(self) -> dict[str, Any]:
+        classes = self.tree.get("classes", [])
+        return {
+            "model": "StateDT",
+            "compiler": "decision-sufficient-state",
+            "semantics_version": SEMANTICS_VERSION,
+            "feature_state_bits": self.feature_state_bits,
+            "features": list(self.feature_specs),
+            "class_ids": {label: index for index, label in enumerate(classes)},
+            "feature_specs": {
+                feature: asdict(spec) for feature, spec in self.feature_specs.items()
+            },
+            "tree": self.tree,
+        }
 
 
 @dataclass
 class TrainedStateDT:
     model: Any
     features: list[str]
-    candidates: list[StateDTCandidate]
+    compiled: CompiledStateDT
+
+
+@dataclass(frozen=True)
+class EquivalenceReport:
+    samples: int
+    predicates: int
+    predicate_checks: int
+    predicate_mismatches: int
+    prediction_agreement: float
+    path_agreement: float
+    exact: bool
 
 
 @dataclass
@@ -53,262 +113,351 @@ class EvaluatedStateDT:
     predictions: np.ndarray
     macro_f1: float
     resources: ResourceReport
+    equivalence: EquivalenceReport
 
 
-@dataclass(frozen=True)
-class FeatureStateSpec:
-    thresholds: tuple[float, ...]
-    logical_bits: int
+def logical_bits_for_states(state_count: int) -> int:
+    if state_count <= 0:
+        raise ValueError("state_count must be positive")
+    return 0 if state_count == 1 else math.ceil(math.log2(state_count))
 
 
-@dataclass
-class CompiledStateDT:
-    feature_specs: dict[str, FeatureStateSpec]
-    tree: dict[str, Any]
+def threshold_region(value: float, thresholds: tuple[float, ...]) -> int:
+    value32 = float(np.float32(value))
+    return int(np.searchsorted(np.asarray(thresholds), value32, side="left"))
 
 
-def _logical_bits_for_bins(thresholds: tuple[float, ...]) -> int:
-    return 0 if not thresholds else max(1, math.ceil(math.log2(len(thresholds) + 1)))
+def synthesize_feature_spec(feature: str, thresholds: Iterable[float]) -> FeatureStateSpec:
+    if feature not in FEATURE_SEMANTICS:
+        raise ValueError(
+            f"unsupported StateDT stateful feature {feature!r}; define its online update semantics first"
+        )
+    ordered = tuple(sorted(set(float(value) for value in thresholds)))
+    if not ordered:
+        raise ValueError(f"cannot synthesize StateDT state for {feature!r} without tree thresholds")
+    semantics = FEATURE_SEMANTICS[feature]
+    if semantics == "max":
+        state_count = len(ordered) + 1
+        return FeatureStateSpec(
+            feature, semantics, "threshold_region", ordered,
+            logical_bits_for_states(state_count), state_count, None,
+        )
+    cap = math.floor(max(ordered)) + 1
+    if cap < 0:
+        raise ValueError(f"{semantics} feature {feature!r} has an invalid negative cap {cap}")
+    state_count = cap + 1
+    return FeatureStateSpec(
+        feature, semantics, "capped_integer", ordered,
+        logical_bits_for_states(state_count), state_count, cap,
+    )
 
 
-def _encode_value(value: float, thresholds: tuple[float, ...]) -> int:
-    for index, threshold in enumerate(thresholds):
-        if value <= threshold:
-            return index
-    return len(thresholds)
+def encode_concrete_value(value: float, spec: FeatureStateSpec) -> int:
+    value32 = float(np.float32(value))
+    if spec.representation == "threshold_region":
+        return threshold_region(value32, spec.thresholds)
+    _validate_nonnegative_integer(value32, spec.feature)
+    assert spec.cap is not None
+    return min(spec.cap, int(value32))
+
+
+def update_abstract_state(spec: FeatureStateSpec, state: int, packet_value: float) -> int:
+    if state < 0 or state >= spec.state_count:
+        raise ValueError(f"abstract state for {spec.feature!r} is outside its representation")
+    if spec.representation == "threshold_region":
+        return max(state, threshold_region(packet_value, spec.thresholds))
+    _validate_nonnegative_integer(packet_value, f"{spec.feature} increment")
+    assert spec.cap is not None
+    return min(spec.cap, state + int(packet_value))
+
+
+def predicate_from_abstract(spec: FeatureStateSpec, state: int, threshold: float) -> bool:
+    if spec.representation == "threshold_region":
+        try:
+            threshold_index = spec.thresholds.index(float(threshold))
+        except ValueError as exc:
+            raise ValueError(f"threshold {threshold} is not compiled for {spec.feature!r}") from exc
+        return state <= threshold_index
+    return state <= threshold
+
+
+def _validate_nonnegative_integer(value: float, feature: str) -> None:
+    if not math.isfinite(float(value)) or float(value) < 0:
+        raise ValueError(f"StateDT {feature!r} must contain finite non-negative values")
+    if not float(value).is_integer():
+        raise ValueError(f"StateDT {feature!r} must contain integer values")
+
+
+def _validate_feature_domain(frame: pd.DataFrame, features: Iterable[str]) -> None:
+    for feature in features:
+        if feature not in FEATURE_SEMANTICS:
+            raise ValueError(
+                f"unsupported StateDT stateful feature {feature!r}; define its online update semantics first"
+            )
+        values = frame[feature].to_numpy(dtype=float)
+        if not np.isfinite(values).all() or (values < 0).any():
+            raise ValueError(f"StateDT {feature!r} must contain finite non-negative values")
+        if FEATURE_SEMANTICS[feature] in {"counter", "sum"} and not np.equal(values, np.floor(values)).all():
+            raise ValueError(f"StateDT {feature!r} must contain integer values")
 
 
 class StateDT:
-    def __init__(self, config: ExperimentConfig):
+    """Compile a fixed tree into exact decision-observable online state.
+
+    For supported updates U, the compiler constructs alpha and U_hat so that
+    alpha(U(s, p)) == U_hat(alpha(s), p) with respect to every predicate in the
+    fitted tree. Consequently the original and compiled trees follow the same
+    path and make the same decision; the fitted tree is never modified.
+    """
+
+    def __init__(self, config: ExperimentConfig | None = None):
         self.config = config
 
-    def compile(self, model, features: list[str]) -> CompiledStateDT:
+    def compile(self, model: Any, features: list[str]) -> CompiledStateDT:
         thresholds = extract_thresholds_by_feature(model, features)
         specs = {
-            feature: FeatureStateSpec(values, _logical_bits_for_bins(values))
-            for feature, values in thresholds.items()
+            feature: synthesize_feature_spec(feature, thresholds[feature])
+            for feature in features
+            if feature in thresholds
         }
-        return CompiledStateDT(feature_specs=specs, tree=serialize_tree(model, features))
+        return CompiledStateDT(specs, serialize_tree(model, features))
 
-    def predict_compiled(self, compiled: CompiledStateDT, sample: pd.Series) -> tuple[Any, list[int]]:
+    def predict_compiled(self, compiled: CompiledStateDT, sample: pd.Series) -> tuple[str, list[int]]:
         states = {
-            feature: _encode_value(float(np.float32(sample[feature])), spec.thresholds)
+            feature: encode_concrete_value(float(sample[feature]), spec)
             for feature, spec in compiled.feature_specs.items()
         }
         nodes = {node["node_id"]: node for node in compiled.tree["nodes"]}
         node_id = 0
-        path = []
+        path: list[int] = []
         while True:
             node = nodes[node_id]
             path.append(node_id)
             if node["is_leaf"]:
-                return node["prediction"], path
+                return str(node["prediction"]), path
             spec = compiled.feature_specs[node["feature"]]
-            threshold_index = spec.thresholds.index(node["threshold"])
-            node_id = node["left_child"] if states[node["feature"]] <= threshold_index else node["right_child"]
+            go_left = predicate_from_abstract(spec, states[node["feature"]], node["threshold"])
+            node_id = node["left_child"] if go_left else node["right_child"]
 
-    def train(self, split) -> TrainedStateDT:
-        available_features = list(split.X_train.columns)
-        candidates = list(available_features)
-        if self.config.statedt.stateful_only:
-            candidates = list(available_features)
-        if self.config.statedt.explicit_features:
-            missing = [
-                feature
-                for feature in self.config.statedt.explicit_features
-                if feature not in split.X_train.columns
-            ]
+    def train(self, split: Any) -> TrainedStateDT:
+        if self.config is None:
+            raise ValueError("StateDT training requires an experiment configuration")
+        available = set(split.X_train.columns)
+        explicit = list(self.config.statedt.explicit_features)
+        if explicit:
+            missing = [feature for feature in explicit if feature not in available]
             if missing:
                 raise ValueError(f"StateDT explicit feature(s) not found: {', '.join(missing)}")
-            candidates = list(self.config.statedt.explicit_features)
+            unsupported = [feature for feature in explicit if feature not in FEATURE_SEMANTICS]
+            if unsupported:
+                raise ValueError(
+                    "unsupported StateDT stateful feature(s): " + ", ".join(unsupported)
+                    + "; define online update semantics first"
+                )
+            candidates = [feature for feature in STATEFUL_FEATURES if feature in explicit]
+        else:
+            candidates = [feature for feature in STATEFUL_FEATURES if feature in available]
         if not candidates:
-            raise ValueError("StateDT has no candidate features")
+            raise ValueError("StateDT has no supported stateful candidate features")
 
-        if not self.config.statedt.scaling_aware:
-            selected = select_top_k_features(
-                split.X_train,
-                split.y_train,
-                self.config.statedt.max_features,
-                self.config.seed,
-                candidates,
-            )
-            model = fit_tree(split.X_train[selected], split.y_train, self.config.statedt.max_depth, self.config.seed)
-            return TrainedStateDT(model, selected, [])
-
-        max_features = min(self.config.statedt.max_features, len(candidates))
-        ranked = select_top_k_features(
-            split.X_train,
-            split.y_train,
-            max_features,
-            self.config.seed,
-            candidates,
+        limit = min(self.config.statedt.max_features, len(candidates))
+        selected = (
+            candidates
+            if limit == len(candidates)
+            else select_top_k_features(split.X_train, split.y_train, limit, self.config.seed, candidates)
         )
-        out_of_fold_predictions = _state_out_of_fold_predictions(
-            split.X_train,
-            split.y_train,
-            candidates,
-            max_features,
-            self.config.statedt.max_depth,
-            self.config.statedt.validation_folds,
-            self.config.seed,
+        _validate_feature_domain(
+            pd.concat([split.X_train[selected], split.X_test[selected]], ignore_index=True), selected
         )
-        metadata_bits = self.config.statedt.fingerprint_bits + self.config.statedt.generation_bits + self.config.statedt.valid_bits
-        target = TargetProfile.from_config(self.config.target)
-        objective_flows = max(self.config.scaling.requested_flows)
-        population_indices = sample_indices(len(split.y_train), objective_flows, self.config.seed)
-        training_labels = split.y_train.astype(str).to_numpy()
-        population_true = training_labels[population_indices]
-        fallback_label = str(split.y_train.mode().iloc[0])
-        allocation_masks: dict[int, np.ndarray] = {}
-        raw_candidates = []
-
-        for feature_count in range(1, len(ranked) + 1):
-            features = ranked[:feature_count]
-            validation_predictions = out_of_fold_predictions[feature_count]
-            validation_f1 = float(f1_score(training_labels, validation_predictions, average="macro", zero_division=0))
-            full_model = fit_tree(split.X_train[features], split.y_train, self.config.statedt.max_depth, self.config.seed)
-            feature_state_bits = 0
-            resources = estimate_statedt_resources(
-                target,
-                full_model.tree_.node_count,
-                feature_state_bits,
-                metadata_bits,
-                len(features),
-            )
-            capacity = int(resources.estimated_flow_capacity or 0)
-            admitted = allocation_masks.setdefault(
-                capacity,
-                two_choice_allocation(objective_flows, capacity, self.config.seed).admitted_mask,
-            )
-            population_predictions = validation_predictions[population_indices]
-            scaled_predictions = population_predictions.copy()
-            scaled_predictions[~admitted] = fallback_label
-            scaled_f1 = float(f1_score(population_true, scaled_predictions, average="macro", zero_division=0))
-            raw_candidates.append(
-                {
-                    "feature_count": feature_count,
-                    "features": tuple(features),
-                    "validation_f1": validation_f1,
-                    "scaled_validation_f1": scaled_f1,
-                    "feature_state_bits": feature_state_bits,
-                    "aligned_entry_bits": int(resources.aligned_entry_bits or 0),
-                    "estimated_flow_capacity": capacity,
-                    "model": full_model,
-                }
-            )
-
-        best_validation_f1 = max(candidate["validation_f1"] for candidate in raw_candidates)
-        minimum_f1 = best_validation_f1 - self.config.statedt.max_f1_drop
-        eligible = [candidate for candidate in raw_candidates if candidate["validation_f1"] >= minimum_f1]
-        selected_candidate = max(
-            eligible,
-            key=lambda candidate: (
-                candidate["scaled_validation_f1"],
-                candidate["validation_f1"],
-                candidate["estimated_flow_capacity"],
-                -candidate["feature_count"],
-            ),
+        model = fit_tree(
+            split.X_train[selected], split.y_train,
+            self.config.statedt.max_depth, self.config.seed,
         )
-        eligible_feature_counts = {candidate["feature_count"] for candidate in eligible}
-        reports = [
-            StateDTCandidate(
-                feature_count=candidate["feature_count"],
-                features=candidate["features"],
-                validation_f1=candidate["validation_f1"],
-                scaled_validation_f1=candidate["scaled_validation_f1"],
-                feature_state_bits=candidate["feature_state_bits"],
-                aligned_entry_bits=candidate["aligned_entry_bits"],
-                estimated_flow_capacity=candidate["estimated_flow_capacity"],
-                eligible=candidate["feature_count"] in eligible_feature_counts,
-                selected=candidate is selected_candidate,
-            )
-            for candidate in raw_candidates
-        ]
-        return TrainedStateDT(
-            selected_candidate["model"],
-            list(selected_candidate["features"]),
-            reports,
-        )
+        compiled = self.compile(model, selected)
+        return TrainedStateDT(model, selected, compiled)
 
-    def evaluate(self, split) -> EvaluatedStateDT:
-        trained = self.train(split)
-        model = trained.model
+    def validate_exact_equivalence(
+        self, trained: TrainedStateDT, samples: pd.DataFrame
+    ) -> tuple[EquivalenceReport, np.ndarray]:
         selected = trained.features
-        software_predictions, _ = predict_with_path(model, split.X_test[selected])
+        compiled = trained.compiled
+        original_predictions, original_paths = predict_with_path(
+            trained.model, samples[selected]
+        )
+        predicate_mismatches = 0
+        predicate_count = sum(len(spec.thresholds) for spec in compiled.feature_specs.values())
+        for _, sample in samples.iterrows():
+            for feature, spec in compiled.feature_specs.items():
+                concrete = float(np.float32(sample[feature]))
+                abstract = encode_concrete_value(concrete, spec)
+                for threshold in spec.thresholds:
+                    if (concrete <= threshold) != predicate_from_abstract(spec, abstract, threshold):
+                        predicate_mismatches += 1
 
-        metadata_bits = self.config.statedt.fingerprint_bits + self.config.statedt.generation_bits + self.config.statedt.valid_bits
+        compiled_predictions: list[str] = []
+        compiled_paths: list[list[int]] = []
+        for _, sample in samples.iterrows():
+            prediction, path = self.predict_compiled(compiled, sample)
+            compiled_predictions.append(prediction)
+            compiled_paths.append(path)
+        original_strings = np.asarray(original_predictions).astype(str)
+        compiled_array = np.asarray(compiled_predictions)
+        prediction_agreement = float(np.mean(original_strings == compiled_array)) if len(samples) else 1.0
+        path_agreement = float(np.mean([a == b for a, b in zip(original_paths, compiled_paths)])) if len(samples) else 1.0
+        exact = predicate_mismatches == 0 and prediction_agreement == 1.0 and path_agreement == 1.0
+        report = EquivalenceReport(
+            samples=len(samples), predicates=predicate_count,
+            predicate_checks=len(samples) * predicate_count,
+            predicate_mismatches=predicate_mismatches,
+            prediction_agreement=prediction_agreement,
+            path_agreement=path_agreement, exact=exact,
+        )
+        if not exact:
+            raise ValueError(
+                "StateDT exact-equivalence validation failed: "
+                f"predicate_mismatches={predicate_mismatches}, "
+                f"prediction_agreement={prediction_agreement:.6f}, "
+                f"path_agreement={path_agreement:.6f}"
+            )
+        return report, compiled_array
+
+    def evaluate(self, split: Any) -> EvaluatedStateDT:
+        if self.config is None:
+            raise ValueError("StateDT evaluation requires an experiment configuration")
+        trained = self.train(split)
+        equivalence, predictions = self.validate_exact_equivalence(trained, split.X_test)
+        metadata_bits = (
+            self.config.statedt.fingerprint_bits
+            + self.config.statedt.generation_bits
+            + self.config.statedt.valid_bits
+        )
         resources = estimate_statedt_resources(
-            TargetProfile.from_config(self.config.target),
-            model.tree_.node_count,
-            0,
-            metadata_bits,
-            len(selected),
+            TargetProfile.from_config(self.config.target), trained.model.tree_.node_count,
+            trained.compiled.feature_state_bits, metadata_bits,
+            len(trained.compiled.feature_specs),
         )
         return EvaluatedStateDT(
-            trained=trained,
-            predictions=software_predictions,
-            macro_f1=calculate_macro_f1(split.y_test, software_predictions),
-            resources=resources,
+            trained, predictions, calculate_macro_f1(split.y_test, predictions),
+            resources, equivalence,
         )
 
     def run(self, output_dir: Path) -> ModelResult:
+        if self.config is None:
+            raise ValueError("StateDT run requires an experiment configuration")
         random.seed(self.config.seed)
         np.random.seed(self.config.seed)
         split = load_full_flow_dataset(self.config.dataset)
         evaluated = self.evaluate(split)
         trained = evaluated.trained
-        selected = trained.features
-        model = trained.model
         result = ModelResult.from_resources(
-            model="StateDT",
-            dataset=self.config.dataset.name,
-            target=self.config.target.name,
-            seed=self.config.seed,
-            macro_f1=evaluated.macro_f1,
-            max_depth=model.get_depth(),
-            num_features=len(selected),
-            test_samples=len(split.y_test),
-            num_partitions=1,
-            resources=evaluated.resources,
+            model="StateDT", dataset=self.config.dataset.name,
+            target=self.config.target.name, seed=self.config.seed,
+            macro_f1=evaluated.macro_f1, max_depth=trained.model.get_depth(),
+            num_features=len(trained.compiled.feature_specs),
+            test_samples=len(split.y_test), resources=evaluated.resources,
         )
-        save_model_outputs(output_dir, result, {"model": model, "features": selected})
+        save_model_artifacts(
+            output_dir, result, {"model": trained.model, "features": trained.features}
+        )
+        compiler_payload = trained.compiled.to_dict()
+        write_json(output_dir / "compiler.json", compiler_payload)
+        write_json(
+            output_dir / "state_report.json",
+            self._state_report(evaluated),
+        )
+        (output_dir / "state_report.txt").write_text(
+            self._text_report(evaluated), encoding="utf-8"
+        )
         return result
 
+    def _state_report(self, evaluated: EvaluatedStateDT) -> dict[str, Any]:
+        assert self.config is not None
+        compiled = evaluated.trained.compiled
+        # The deployed StateDT data plane stores each of these flow features in
+        # a 16-bit register. TargetConfig.feature_width is the generic tree-key
+        # width and must not be substituted for this original state width.
+        original_bits = len(compiled.feature_specs) * ORIGINAL_FEATURE_STATE_BITS
+        synthesized_bits = compiled.feature_state_bits
+        resources = evaluated.resources
+        metadata_bits = int(resources.metadata_bits or 0)
+        original_aligned_bits = aligned_register_entry_bits(
+            original_bits + metadata_bits, self.config.target.register_word_bits
+        )
+        original_capacity = estimated_flow_capacity(
+            self.config.target.state_memory_mb, original_aligned_bits
+        )
+        return {
+            "model": "StateDT",
+            "compiler": "decision-sufficient-state",
+            "dataset": self.config.dataset.name,
+            "target": self.config.target.name,
+            "seed": self.config.seed,
+            "tree_depth": evaluated.trained.model.get_depth(),
+            "tree_nodes": evaluated.trained.model.tree_.node_count,
+            "stateful_features_used": list(compiled.feature_specs),
+            "original_feature_state_bits": original_bits,
+            "decision_sufficient_feature_state_bits": synthesized_bits,
+            "logical_state_reduction": 0.0 if original_bits == 0 else 1.0 - synthesized_bits / original_bits,
+            "original_aligned_entry_bits": original_aligned_bits,
+            "original_estimated_flow_capacity": original_capacity,
+            "per_feature": {
+                feature: {
+                    "semantics": spec.semantics,
+                    "original_bits": ORIGINAL_FEATURE_STATE_BITS,
+                    "synthesized_bits": spec.logical_bits,
+                    "representation": spec.representation,
+                    "thresholds": list(spec.thresholds),
+                    "state_count": spec.state_count,
+                    "cap": spec.cap,
+                }
+                for feature, spec in compiled.feature_specs.items()
+            },
+            "exact_equivalence": asdict(evaluated.equivalence),
+            "resource_usage": {
+                "metadata_bits": resources.metadata_bits,
+                "logical_entry_bits": resources.logical_entry_bits,
+                "aligned_entry_bits": resources.aligned_entry_bits,
+                "register_words_per_flow": resources.register_words_per_flow,
+                "estimated_flow_capacity": resources.estimated_flow_capacity,
+                "capacity_improvement": (
+                    0.0 if original_capacity == 0
+                    else int(resources.estimated_flow_capacity or 0) / original_capacity
+                ),
+            },
+        }
 
-def _state_out_of_fold_predictions(
-    features: pd.DataFrame,
-    labels: pd.Series,
-    candidates: list[str],
-    max_features: int,
-    max_depth: int,
-    requested_folds: int,
-    seed: int,
-) -> dict[int, np.ndarray]:
-    counts = labels.value_counts()
-    can_stratify = len(counts) > 1 and int(counts.min()) >= 2
-    folds = min(requested_folds, int(counts.min())) if can_stratify else min(requested_folds, len(labels))
-    if folds < 2:
-        raise ValueError("scaling-aware StateDT training requires at least two validation folds")
-    predictions = {feature_count: np.empty(len(labels), dtype=object) for feature_count in range(1, max_features + 1)}
-    splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed) if can_stratify else KFold(n_splits=folds, shuffle=True, random_state=seed)
-    split_iterator = splitter.split(features, labels) if can_stratify else splitter.split(features)
-    for fold, (fit_positions, validation_positions) in enumerate(split_iterator):
-        X_fit = features.iloc[fit_positions]
-        y_fit = labels.iloc[fit_positions]
-        ranked = select_top_k_features(X_fit, y_fit, max_features, seed + fold, candidates)
-        for feature_count in range(1, max_features + 1):
-            selected = ranked[:feature_count]
-            model = fit_tree(X_fit[selected], y_fit, max_depth, seed + fold)
-            predictions[feature_count][validation_positions] = model.predict(features.iloc[validation_positions][selected]).astype(str)
-    return predictions
-
-
-def save_model_outputs(
-    output_dir: Path,
-    result: ModelResult,
-    model_payload,
-) -> None:
-    save_model_artifacts(output_dir, result, model_payload)
+    def _text_report(self, evaluated: EvaluatedStateDT) -> str:
+        report = self._state_report(evaluated)
+        exact = report["exact_equivalence"]
+        resources = report["resource_usage"]
+        rows = [
+            "StateDT Decision-Sufficient State Report", "========================================", "",
+            f"Dataset: {report['dataset']}", f"Target: {report['target']}", "",
+            f"Tree depth: {report['tree_depth']}", f"Tree nodes: {report['tree_nodes']}",
+            f"Stateful features used: {', '.join(report['stateful_features_used'])}", "",
+        ]
+        for feature, item in report["per_feature"].items():
+            rows.append(
+                f"{feature}: {item['semantics']}, {item['original_bits']} -> "
+                f"{item['synthesized_bits']} bits ({item['representation']})"
+            )
+        rows.extend([
+            "", f"Predicate checks: {exact['predicate_checks']}",
+            f"Predicate mismatches: {exact['predicate_mismatches']}",
+            f"Prediction agreement: {exact['prediction_agreement']:.2%}",
+            f"Path agreement: {exact['path_agreement']:.2%}", "",
+            f"Original feature state bits: {report['original_feature_state_bits']}",
+            f"Decision-sufficient state bits: {report['decision_sufficient_feature_state_bits']}",
+            f"Metadata bits: {resources['metadata_bits']}",
+            f"Logical entry bits: {resources['logical_entry_bits']}",
+            f"Aligned entry bits: {resources['aligned_entry_bits']}",
+            f"Register words / flow: {resources['register_words_per_flow']}",
+            f"Estimated flow capacity: {resources['estimated_flow_capacity']}", "",
+            f"Original aligned entry bits: {report['original_aligned_entry_bits']}",
+            f"Original estimated flow capacity: {report['original_estimated_flow_capacity']}",
+            f"Capacity improvement: {resources['capacity_improvement']:.3f}x", "",
+        ])
+        return "\n".join(rows)
 
 
 def run_statedt(config: ExperimentConfig, output_dir: Path) -> ModelResult:
@@ -316,21 +465,20 @@ def run_statedt(config: ExperimentConfig, output_dir: Path) -> ModelResult:
 
 
 def synthetic_example() -> None:
-    rows = pd.DataFrame(
-        [
-            {"Total Length of Fwd Packet": 1000, "Packet Length Max": 1100, "SYN Flag Count": 0},
-            {"Total Length of Fwd Packet": 2500, "Packet Length Max": 1300, "SYN Flag Count": 3},
-            {"Total Length of Fwd Packet": 5200, "Packet Length Max": 1300, "SYN Flag Count": 3},
-            {"Total Length of Fwd Packet": 5200, "Packet Length Max": 1100, "SYN Flag Count": 6},
-        ]
-    )
+    rows = pd.DataFrame([
+        {"Total Length of Fwd Packet": 1000, "Packet Length Max": 1100},
+        {"Total Length of Fwd Packet": 2500, "Packet Length Max": 1300},
+        {"Total Length of Fwd Packet": 5200, "Packet Length Max": 1300},
+        {"Total Length of Fwd Packet": 5200, "Packet Length Max": 1100},
+    ])
     labels = pd.Series(["Benign", "Benign", "Volumetric Attack", "SYN Attack"])
+    features = list(rows.columns)
     model = fit_tree(rows, labels, 3, 42)
-    config = object.__new__(StateDT)
-    compiled = StateDT.compile(config, model, list(rows.columns))
+    statedt = StateDT()
+    compiled = statedt.compile(model, features)
     sample = rows.iloc[2]
-    prediction, path = StateDT.predict_compiled(config, compiled, sample)
+    prediction, path = statedt.predict_compiled(compiled, sample)
     software_prediction, software_path = predict_with_path(model, pd.DataFrame([sample]))
     print({"software_prediction": software_prediction[0], "statedt_prediction": prediction})
     print({"software_path": software_path[0], "statedt_path": path})
-    print({"agreement": software_prediction[0] == prediction and software_path[0] == path})
+    print({"agreement": str(software_prediction[0]) == prediction and software_path[0] == path})

@@ -88,6 +88,7 @@ class StateDTConfig(BasicTreeConfig):
     valid_bits: int
     allocator: str
     fallback: str
+    exact_equivalence: bool
 
 
 @dataclass(frozen=True)
@@ -292,7 +293,10 @@ def load_experiment_config(path: str) -> ExperimentConfig:
         valid_bits=_positive_int(state.get("valid_bits"), "statedt.state.valid_bits"),
         allocator=str(state.get("allocator")),
         fallback=str(statedt_raw.get("fallback", "majority_class")),
+        exact_equivalence=bool(statedt_raw.get("exact_equivalence", True)),
     )
+    if not statedt.exact_equivalence:
+        raise ValueError("statedt.exact_equivalence must be true")
     if statedt.fallback not in {"majority_class", "no_prediction"}:
         raise ValueError("statedt.fallback must be 'majority_class' or 'no_prediction'")
 

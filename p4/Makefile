@@ -1,6 +1,6 @@
 ROOT := $(abspath ..)
 BUILD_DIR ?= $(ROOT)/p4/build
-MODEL ?= $(ROOT)/results/CIC-IDS-2017-PCAPS1-f10/statedt/model.pkl
+MODEL ?= $(ROOT)/results/CIC-IDS-2017/statedt/compiler.json
 PYTHON ?= $(ROOT)/.venv/bin/python
 P4C_BMV2 ?= p4c-bm2-ss
 P4TEST ?= p4test
