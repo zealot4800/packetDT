@@ -2,6 +2,8 @@
 #include <v1model.p4>
 #include "../common/statedt_headers.p4"
 #include "../common/statedt_model.p4inc"
+#include "../common/statedt_layout.p4inc"
+#include "../common/statedt_bmv2_type.p4inc"
 
 const bit<32> FLOW_BANK_SIZE = 32w32768;
 
@@ -18,7 +20,7 @@ struct metadata_t {
     bit<1> forward;
     bit<1> state_valid;
     bit<8> class_id;
-    bit<114> state;
+    statedt_entry_t state;
     flow_features_t features;
 }
 
@@ -65,8 +67,8 @@ control StateDTIngress(
         inout headers_t hdr,
         inout metadata_t meta,
         inout standard_metadata_t standard_metadata) {
-    register<bit<114>>(FLOW_BANK_SIZE) flow_bank0;
-    register<bit<114>>(FLOW_BANK_SIZE) flow_bank1;
+    register<statedt_entry_t>(FLOW_BANK_SIZE) flow_bank0;
+    register<statedt_entry_t>(FLOW_BANK_SIZE) flow_bank1;
 
     action set_class(bit<8> class_id) {
         meta.class_id = class_id;
@@ -122,6 +124,7 @@ control StateDTIngress(
 
     action update_state() {
         bit<16> packet_length;
+        bit<16> incoming_region;
         bit<17> total;
 
         if (hdr.tcp.isValid()) {
@@ -131,18 +134,13 @@ control StateDTIngress(
             packet_length = hdr.udp.length - 8;
         }
 
-        meta.features.packet_length_max = meta.state[95:80];
-        meta.features.psh_flag_count = meta.state[79:64];
-        meta.features.total_fwd_length = meta.state[63:48];
-        meta.features.fin_flag_count = meta.state[47:32];
-        meta.features.fwd_packet_length_max = meta.state[31:16];
-        meta.features.total_bwd_packets = meta.state[15:0];
+#include "../common/statedt_unpack_features.p4inc"
 
-        if (packet_length > meta.features.packet_length_max) {
-            meta.features.packet_length_max = packet_length;
-        }
-        if (meta.features.packet_length_max > CAP_PACKET_LENGTH_MAX) {
-            meta.features.packet_length_max = CAP_PACKET_LENGTH_MAX;
+        // Maximum features store threshold-region identifiers, not concrete
+        // packet lengths. The model-specific encoder is compiler generated.
+#include "../common/statedt_update_packet_max.p4inc"
+        if (incoming_region > meta.features.packet_length_max) {
+            meta.features.packet_length_max = incoming_region;
         }
 
         if (hdr.tcp.isValid() && hdr.tcp.psh == 1 &&
@@ -161,37 +159,31 @@ control StateDTIngress(
             } else {
                 meta.features.total_fwd_length = (bit<16>) total;
             }
-            if (packet_length > meta.features.fwd_packet_length_max) {
-                meta.features.fwd_packet_length_max = packet_length;
-            }
-            if (meta.features.fwd_packet_length_max > CAP_FWD_PACKET_LENGTH_MAX) {
-                meta.features.fwd_packet_length_max = CAP_FWD_PACKET_LENGTH_MAX;
+            incoming_region = 0;
+#include "../common/statedt_update_fwd_packet_max.p4inc"
+            if (incoming_region > meta.features.fwd_packet_length_max) {
+                meta.features.fwd_packet_length_max = incoming_region;
             }
         } else if (meta.features.total_bwd_packets < CAP_TOTAL_BWD_PACKETS) {
             meta.features.total_bwd_packets = meta.features.total_bwd_packets + 1;
         }
 
-        meta.state[95:80] = meta.features.packet_length_max;
-        meta.state[79:64] = meta.features.psh_flag_count;
-        meta.state[63:48] = meta.features.total_fwd_length;
-        meta.state[47:32] = meta.features.fin_flag_count;
-        meta.state[31:16] = meta.features.fwd_packet_length_max;
-        meta.state[15:0] = meta.features.total_bwd_packets;
+#include "../common/statedt_pack_features.p4inc"
     }
 
     action try_bank0() {
         flow_bank0.read(meta.state, meta.index0);
-        if (meta.state[113:113] == 0) {
+        if (meta.state[STATEDT_VALID_BIT:STATEDT_VALID_BIT] == 0) {
             meta.state = 0;
-            meta.state[113:113] = 1;
-            meta.state[112:112] = meta.packet_low_to_high;
-            meta.state[111:96] = meta.fingerprint;
+            meta.state[STATEDT_VALID_BIT:STATEDT_VALID_BIT] = 1;
+            meta.state[STATEDT_DIRECTION_BIT:STATEDT_DIRECTION_BIT] = meta.packet_low_to_high;
+            meta.state[STATEDT_FINGERPRINT_MSB:STATEDT_FINGERPRINT_LSB] = meta.fingerprint;
             meta.forward = 1;
             meta.claimed = 1;
             update_state();
             flow_bank0.write(meta.index0, meta.state);
-        } else if (meta.state[111:96] == meta.fingerprint) {
-            meta.forward = (bit<1>)(meta.state[112:112] == meta.packet_low_to_high);
+        } else if (meta.state[STATEDT_FINGERPRINT_MSB:STATEDT_FINGERPRINT_LSB] == meta.fingerprint) {
+            meta.forward = (bit<1>)(meta.state[STATEDT_DIRECTION_BIT:STATEDT_DIRECTION_BIT] == meta.packet_low_to_high);
             meta.claimed = 1;
             update_state();
             flow_bank0.write(meta.index0, meta.state);
@@ -200,17 +192,17 @@ control StateDTIngress(
 
     action try_bank1() {
         flow_bank1.read(meta.state, meta.index1);
-        if (meta.state[113:113] == 0) {
+        if (meta.state[STATEDT_VALID_BIT:STATEDT_VALID_BIT] == 0) {
             meta.state = 0;
-            meta.state[113:113] = 1;
-            meta.state[112:112] = meta.packet_low_to_high;
-            meta.state[111:96] = meta.fingerprint;
+            meta.state[STATEDT_VALID_BIT:STATEDT_VALID_BIT] = 1;
+            meta.state[STATEDT_DIRECTION_BIT:STATEDT_DIRECTION_BIT] = meta.packet_low_to_high;
+            meta.state[STATEDT_FINGERPRINT_MSB:STATEDT_FINGERPRINT_LSB] = meta.fingerprint;
             meta.forward = 1;
             meta.claimed = 1;
             update_state();
             flow_bank1.write(meta.index1, meta.state);
-        } else if (meta.state[111:96] == meta.fingerprint) {
-            meta.forward = (bit<1>)(meta.state[112:112] == meta.packet_low_to_high);
+        } else if (meta.state[STATEDT_FINGERPRINT_MSB:STATEDT_FINGERPRINT_LSB] == meta.fingerprint) {
+            meta.forward = (bit<1>)(meta.state[STATEDT_DIRECTION_BIT:STATEDT_DIRECTION_BIT] == meta.packet_low_to_high);
             meta.claimed = 1;
             update_state();
             flow_bank1.write(meta.index1, meta.state);

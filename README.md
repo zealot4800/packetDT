@@ -15,3 +15,14 @@ StateDT's former `feature_selection.scaling_aware`, `validation_folds`, and
 `max_f1_drop` configuration keys are accepted for compatibility but deprecated
 and unused. StateDT does not perform epsilon/F1-loss or capacity-aware model
 selection; exact predicate, prediction, and decision-path agreement is required.
+
+## Research status
+
+StateDT is an active research prototype. The semantic compiler and generated
+BMv2 packed layout are implemented, but hardware-target packing and end-to-end
+packet-replay equivalence are still being brought into alignment. Do not
+interpret logical state estimates as measured hardware savings until the
+applicable target compiler report confirms the allocation.
+
+The DSN research plan and claim ledger are in `docs/dsn_readiness.md`. The
+working presentation is in `slides/dsn_statedt.md`.

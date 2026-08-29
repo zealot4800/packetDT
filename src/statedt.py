@@ -75,11 +75,32 @@ class CompiledStateDT:
 
     def to_dict(self) -> dict[str, Any]:
         classes = self.tree.get("classes", [])
+        offset = 0
+        layout_fields = []
+        for feature, spec in self.feature_specs.items():
+            width = spec.logical_bits
+            layout_fields.append({
+                "feature": feature,
+                "representation": spec.representation,
+                "offset": offset,
+                "lsb": offset,
+                "msb": offset + width - 1 if width else None,
+                "width": width,
+                "state_count": spec.state_count,
+                "initial_state": 0,
+            })
+            offset += width
         return {
             "model": "StateDT",
             "compiler": "decision-sufficient-state",
             "semantics_version": SEMANTICS_VERSION,
             "feature_state_bits": self.feature_state_bits,
+            "state_layout": {
+                "version": 1,
+                "bit_order": "lsb0",
+                "feature_state_bits": self.feature_state_bits,
+                "fields": layout_fields,
+            },
             "features": list(self.feature_specs),
             "class_ids": {label: index for index, label in enumerate(classes)},
             "feature_specs": {
