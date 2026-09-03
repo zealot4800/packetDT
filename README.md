@@ -11,16 +11,20 @@ non-negative `counter`, and non-negative `sum` feature semantics. A run writes
 `compiler.json`, `state_report.json`, and a readable `state_report.txt` beside
 the normal `model.pkl` and `metrics.csv` artifacts.
 
-StateDT's former `feature_selection.scaling_aware`, `validation_folds`, and
-`max_f1_drop` configuration keys are accepted for compatibility but deprecated
-and unused. StateDT does not perform epsilon/F1-loss or capacity-aware model
-selection; exact predicate, prediction, and decision-path agreement is required.
+StateDT does not perform epsilon/F1-loss or capacity-aware model selection;
+exact predicate, prediction, and decision-path agreement is required.
+
+StateDT flow state uses the compiler-emitted `state_layout`: synthesized
+feature fields, a 16-bit fingerprint, one initiator-direction bit, and one
+valid bit. A two-choice miss returns an explicit collision-fallback status; it
+never classifies with an occupied entry belonging to another fingerprint. All
+P4 targets expose allocation, fingerprint-mismatch, collision, and fallback
+counters.
 
 ## Research status
 
 StateDT is an active research prototype. The semantic compiler and generated
-BMv2 packed layout are implemented, but hardware-target packing and end-to-end
-packet-replay equivalence are still being brought into alignment. Do not
+state layout are shared by the BMv2, Tofino, and Xilinx implementations. Do not
 interpret logical state estimates as measured hardware savings until the
 applicable target compiler report confirms the allocation.
 

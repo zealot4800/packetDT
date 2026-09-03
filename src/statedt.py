@@ -51,6 +51,22 @@ FEATURE_SEMANTICS = {
 
 SEMANTICS_VERSION = 1
 ORIGINAL_FEATURE_STATE_BITS = 16
+STATE_LAYOUT_VERSION = 2
+DEFAULT_FINGERPRINT_BITS = 16
+VALID_BITS = 1
+DIRECTION_BITS = 1
+STATE_STATUS_CODES = {
+    "MATCH": 0,
+    "ALLOCATED": 1,
+    "FALLBACK_COLLISION": 2,
+    "NOT_PROCESSED": 3,
+}
+STATE_COUNTER_NAMES = (
+    "allocations",
+    "fingerprint_mismatches",
+    "collisions",
+    "fallbacks",
+)
 
 
 @dataclass(frozen=True)
@@ -68,18 +84,30 @@ class FeatureStateSpec:
 class CompiledStateDT:
     feature_specs: dict[str, FeatureStateSpec]
     tree: dict[str, Any]
+    fingerprint_bits: int = DEFAULT_FINGERPRINT_BITS
+    direction_bits: int = DIRECTION_BITS
+    valid_bits: int = VALID_BITS
 
     @property
     def feature_state_bits(self) -> int:
         return sum(spec.logical_bits for spec in self.feature_specs.values())
 
-    def to_dict(self) -> dict[str, Any]:
-        classes = self.tree.get("classes", [])
+    @property
+    def metadata_bits(self) -> int:
+        return self.fingerprint_bits + self.direction_bits + self.valid_bits
+
+    @property
+    def entry_bits(self) -> int:
+        return self.feature_state_bits + self.metadata_bits
+
+    def state_layout(self) -> dict[str, Any]:
         offset = 0
-        layout_fields = []
+        fields: list[dict[str, Any]] = []
         for feature, spec in self.feature_specs.items():
             width = spec.logical_bits
-            layout_fields.append({
+            fields.append({
+                "name": feature,
+                "role": "feature_state",
                 "feature": feature,
                 "representation": spec.representation,
                 "offset": offset,
@@ -90,17 +118,49 @@ class CompiledStateDT:
                 "initial_state": 0,
             })
             offset += width
+
+        for name, role, width in (
+            ("flow_fingerprint", "fingerprint", self.fingerprint_bits),
+            ("direction", "direction", self.direction_bits),
+            ("valid", "valid", self.valid_bits),
+        ):
+            field = {
+                "name": name,
+                "role": role,
+                "offset": offset,
+                "lsb": offset,
+                "msb": offset + width - 1,
+                "width": width,
+                "initial_state": 0,
+            }
+            if role == "direction":
+                field["semantics"] = "first_packet_low_to_high"
+            fields.append(field)
+            offset += width
+        assert offset == self.entry_bits
+        return {
+            "version": STATE_LAYOUT_VERSION,
+            "bit_order": "lsb0",
+            "feature_state_bits": self.feature_state_bits,
+            "metadata_bits": self.metadata_bits,
+            "entry_bits": self.entry_bits,
+            "fingerprint_bits": self.fingerprint_bits,
+            "direction_bits": self.direction_bits,
+            "valid_bits": self.valid_bits,
+            "status_codes": dict(STATE_STATUS_CODES),
+            "counters": list(STATE_COUNTER_NAMES),
+            "collision_policy": "explicit_fallback_no_state",
+            "fields": fields,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        classes = self.tree.get("classes", [])
         return {
             "model": "StateDT",
             "compiler": "decision-sufficient-state",
             "semantics_version": SEMANTICS_VERSION,
             "feature_state_bits": self.feature_state_bits,
-            "state_layout": {
-                "version": 1,
-                "bit_order": "lsb0",
-                "feature_state_bits": self.feature_state_bits,
-                "fields": layout_fields,
-            },
+            "state_layout": self.state_layout(),
             "features": list(self.feature_specs),
             "class_ids": {label: index for index, label in enumerate(classes)},
             "feature_specs": {
@@ -241,7 +301,18 @@ class StateDT:
             for feature in features
             if feature in thresholds
         }
-        return CompiledStateDT(specs, serialize_tree(model, features))
+        fingerprint_bits = (
+            self.config.statedt.fingerprint_bits if self.config else DEFAULT_FINGERPRINT_BITS
+        )
+        direction_bits = self.config.statedt.direction_bits if self.config else DIRECTION_BITS
+        valid_bits = self.config.statedt.valid_bits if self.config else VALID_BITS
+        return CompiledStateDT(
+            specs,
+            serialize_tree(model, features),
+            fingerprint_bits=fingerprint_bits,
+            direction_bits=direction_bits,
+            valid_bits=valid_bits,
+        )
 
     def predict_compiled(self, compiled: CompiledStateDT, sample: pd.Series) -> tuple[str, list[int]]:
         states = {
@@ -347,15 +418,13 @@ class StateDT:
             raise ValueError("StateDT evaluation requires an experiment configuration")
         trained = self.train(split)
         equivalence, predictions = self.validate_exact_equivalence(trained, split.X_test)
-        metadata_bits = (
-            self.config.statedt.fingerprint_bits
-            + self.config.statedt.generation_bits
-            + self.config.statedt.valid_bits
-        )
         resources = estimate_statedt_resources(
             TargetProfile.from_config(self.config.target), trained.model.tree_.node_count,
-            trained.compiled.feature_state_bits, metadata_bits,
+            trained.compiled.feature_state_bits,
             len(trained.compiled.feature_specs),
+            fingerprint_bits=trained.compiled.fingerprint_bits,
+            direction_bits=trained.compiled.direction_bits,
+            valid_bits=trained.compiled.valid_bits,
         )
         return EvaluatedStateDT(
             trained, predictions, calculate_macro_f1(split.y_test, predictions),
@@ -416,6 +485,7 @@ class StateDT:
             "tree_depth": evaluated.trained.model.get_depth(),
             "tree_nodes": evaluated.trained.model.tree_.node_count,
             "stateful_features_used": list(compiled.feature_specs),
+            "state_layout": compiled.state_layout(),
             "original_feature_state_bits": original_bits,
             "decision_sufficient_feature_state_bits": synthesized_bits,
             "logical_state_reduction": 0.0 if original_bits == 0 else 1.0 - synthesized_bits / original_bits,

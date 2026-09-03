@@ -2,6 +2,8 @@
 #include <tna.p4>
 #include "../common/statedt_headers.p4"
 #include "../common/statedt_model.p4inc"
+#include "../common/statedt_layout.p4inc"
+#include "../common/statedt_entry_type.p4inc"
 
 @pragma pa_auto_init_metadata
 
@@ -12,22 +14,19 @@ struct metadata_t {
     bit<32> high_addr;
     bit<16> low_port;
     bit<16> high_port;
-    bit<16> src_port;
+    bit<1> packet_low_to_high;
     bit<15> index0;
     bit<15> index1;
     bit<16> fingerprint;
-    bit<16> endpoint_fingerprint;
-    bit<1> claimed;
-    bit<1> selected_bank;
     bit<1> forward;
     bit<1> state_valid;
+    bit<2> state_status;
     bit<1> packet_psh;
     bit<1> packet_fin;
     bit<16> packet_length;
-    bit<16> fwd_packet_length;
-    bit<16> total_fwd_increment;
-    bit<16> bwd_packet_increment;
     bit<8> class_id;
+    bit<2> mismatch_increment;
+    bit<32> counter_value;
     flow_features_t features;
 }
 
@@ -46,12 +45,10 @@ parser SwitchIngressParser(
             default: reject;
         }
     }
-
     state parse_port_metadata {
         pkt.advance(PORT_METADATA_SIZE);
         transition parse_ethernet;
     }
-
     state parse_ethernet {
         pkt.extract(hdr.ethernet);
         transition select(hdr.ethernet.ether_type) {
@@ -59,7 +56,6 @@ parser SwitchIngressParser(
             default: accept;
         }
     }
-
     state parse_ipv4 {
         pkt.extract(hdr.ipv4);
         transition select(hdr.ipv4.ihl, hdr.ipv4.fragment_offset, hdr.ipv4.protocol) {
@@ -68,16 +64,8 @@ parser SwitchIngressParser(
             default: accept;
         }
     }
-
-    state parse_tcp {
-        pkt.extract(hdr.tcp);
-        transition accept;
-    }
-
-    state parse_udp {
-        pkt.extract(hdr.udp);
-        transition accept;
-    }
+    state parse_tcp { pkt.extract(hdr.tcp); transition accept; }
+    state parse_udp { pkt.extract(hdr.udp); transition accept; }
 }
 
 control SwitchIngress(
@@ -90,175 +78,109 @@ control SwitchIngress(
     Hash<bit<15>>(HashAlgorithm_t.CRC16) index_hash0;
     Hash<bit<15>>(HashAlgorithm_t.CRC16) index_hash1;
     Hash<bit<16>>(HashAlgorithm_t.CRC16) fingerprint_hash;
-    Hash<bit<16>>(HashAlgorithm_t.CRC16) endpoint_hash;
 
-    Register<bit<16>, bit<15>>(FLOW_BANK_SIZE, 16w0) flow_id_bank0;
-    Register<bit<16>, bit<15>>(FLOW_BANK_SIZE, 16w0) flow_id_bank1;
-    Register<bit<16>, bit<15>>(FLOW_BANK_SIZE, 16w0) flow_dir_bank0;
-    Register<bit<16>, bit<15>>(FLOW_BANK_SIZE, 16w0) flow_dir_bank1;
+    // One canonical packed entry per choice makes ownership validation and
+    // update one atomic RegisterAction operation.
+    Register<statedt_entry_t, bit<15>>(FLOW_BANK_SIZE, 0) flow_bank0;
+    Register<statedt_entry_t, bit<15>>(FLOW_BANK_SIZE, 0) flow_bank1;
 
-    Register<bit<16>, bit<15>>(FLOW_BANK_SIZE, 16w0) packet_max_bank0;
-    Register<bit<16>, bit<15>>(FLOW_BANK_SIZE, 16w0) psh_bank0;
-    Register<bit<16>, bit<15>>(FLOW_BANK_SIZE, 16w0) total_fwd_bank0;
-    Register<bit<16>, bit<15>>(FLOW_BANK_SIZE, 16w0) fin_bank0;
-    Register<bit<16>, bit<15>>(FLOW_BANK_SIZE, 16w0) fwd_max_bank0;
-    Register<bit<16>, bit<15>>(FLOW_BANK_SIZE, 16w0) bwd_packets_bank0;
+    Register<bit<32>, bit<1>>(1, 32w0) statedt_allocations;
+    Register<bit<32>, bit<1>>(1, 32w0) statedt_fingerprint_mismatches;
+    Register<bit<32>, bit<1>>(1, 32w0) statedt_collisions;
+    Register<bit<32>, bit<1>>(1, 32w0) statedt_fallbacks;
 
-    Register<bit<16>, bit<15>>(FLOW_BANK_SIZE, 16w0) packet_max_bank1;
-    Register<bit<16>, bit<15>>(FLOW_BANK_SIZE, 16w0) psh_bank1;
-    Register<bit<16>, bit<15>>(FLOW_BANK_SIZE, 16w0) total_fwd_bank1;
-    Register<bit<16>, bit<15>>(FLOW_BANK_SIZE, 16w0) fin_bank1;
-    Register<bit<16>, bit<15>>(FLOW_BANK_SIZE, 16w0) fwd_max_bank1;
-    Register<bit<16>, bit<15>>(FLOW_BANK_SIZE, 16w0) bwd_packets_bank1;
+    RegisterAction<bit<32>, bit<1>, bit<32>>(statedt_allocations) count_allocation = {
+        void apply(inout bit<32> value, out bit<32> result) {
+            value = value + 1; result = value;
+        }
+    };
+    RegisterAction<bit<32>, bit<1>, bit<32>>(statedt_fingerprint_mismatches) count_mismatch = {
+        void apply(inout bit<32> value, out bit<32> result) {
+            value = value + (bit<32>) meta.mismatch_increment; result = value;
+        }
+    };
+    RegisterAction<bit<32>, bit<1>, bit<32>>(statedt_collisions) count_collision = {
+        void apply(inout bit<32> value, out bit<32> result) {
+            value = value + 1; result = value;
+        }
+    };
+    RegisterAction<bit<32>, bit<1>, bit<32>>(statedt_fallbacks) count_fallback = {
+        void apply(inout bit<32> value, out bit<32> result) {
+            value = value + 1; result = value;
+        }
+    };
 
-    RegisterAction<bit<16>, bit<15>, bit<1>>(flow_id_bank0) claim_bank0 = {
-        void apply(inout bit<16> value, out bit<1> result) {
-            result = 0;
-            if (value == 0) {
-                value = meta.fingerprint;
-                result = 1;
-            } else if (value == meta.fingerprint) {
-                result = 1;
+    RegisterAction<statedt_entry_t, bit<15>, bit<2>>(flow_bank0) access_bank0 = {
+        void apply(inout statedt_entry_t value, out bit<2> result) {
+            bit<16> incoming_region;
+            bit<17> total;
+            result = STATEDT_STATUS_NOT_PROCESSED;
+            if (value[STATEDT_VALID_BIT:STATEDT_VALID_BIT] == 0) {
+                value = 0;
+                value[STATEDT_FINGERPRINT_MSB:STATEDT_FINGERPRINT_LSB] = meta.fingerprint;
+                value[STATEDT_DIRECTION_BIT:STATEDT_DIRECTION_BIT] = meta.packet_low_to_high;
+                value[STATEDT_VALID_BIT:STATEDT_VALID_BIT] = 1;
+                meta.forward = 1;
+#include "../common/statedt_update_value.p4inc"
+                result = STATEDT_STATUS_ALLOCATED;
+            } else if (value[STATEDT_FINGERPRINT_MSB:STATEDT_FINGERPRINT_LSB] == meta.fingerprint) {
+                meta.forward = (bit<1>)(value[STATEDT_DIRECTION_BIT:STATEDT_DIRECTION_BIT] == meta.packet_low_to_high);
+#include "../common/statedt_update_value.p4inc"
+                result = STATEDT_STATUS_MATCH;
             }
         }
     };
 
-    RegisterAction<bit<16>, bit<15>, bit<1>>(flow_id_bank1) claim_bank1 = {
-        void apply(inout bit<16> value, out bit<1> result) {
-            result = 0;
-            if (value == 0) {
-                value = meta.fingerprint;
-                result = 1;
-            } else if (value == meta.fingerprint) {
-                result = 1;
+    RegisterAction<statedt_entry_t, bit<15>, bit<2>>(flow_bank1) access_bank1 = {
+        void apply(inout statedt_entry_t value, out bit<2> result) {
+            bit<16> incoming_region;
+            bit<17> total;
+            result = STATEDT_STATUS_NOT_PROCESSED;
+            if (value[STATEDT_VALID_BIT:STATEDT_VALID_BIT] == 0) {
+                value = 0;
+                value[STATEDT_FINGERPRINT_MSB:STATEDT_FINGERPRINT_LSB] = meta.fingerprint;
+                value[STATEDT_DIRECTION_BIT:STATEDT_DIRECTION_BIT] = meta.packet_low_to_high;
+                value[STATEDT_VALID_BIT:STATEDT_VALID_BIT] = 1;
+                meta.forward = 1;
+#include "../common/statedt_update_value.p4inc"
+                result = STATEDT_STATUS_ALLOCATED;
+            } else if (value[STATEDT_FINGERPRINT_MSB:STATEDT_FINGERPRINT_LSB] == meta.fingerprint) {
+                meta.forward = (bit<1>)(value[STATEDT_DIRECTION_BIT:STATEDT_DIRECTION_BIT] == meta.packet_low_to_high);
+#include "../common/statedt_update_value.p4inc"
+                result = STATEDT_STATUS_MATCH;
             }
         }
     };
 
-    RegisterAction<bit<16>, bit<15>, bit<1>>(flow_dir_bank0) direction_bank0 = {
-        void apply(inout bit<16> value, out bit<1> result) {
-            result = 0;
-            if (value == 0) {
-                value = meta.endpoint_fingerprint;
-                result = 1;
-            } else if (value == meta.endpoint_fingerprint) {
-                result = 1;
-            }
-        }
-    };
+    action set_class(bit<8> class_id) { meta.class_id = class_id; }
 
-    RegisterAction<bit<16>, bit<15>, bit<1>>(flow_dir_bank1) direction_bank1 = {
-        void apply(inout bit<16> value, out bit<1> result) {
-            result = 0;
-            if (value == 0) {
-                value = meta.endpoint_fingerprint;
-                result = 1;
-            } else if (value == meta.endpoint_fingerprint) {
-                result = 1;
-            }
-        }
-    };
-
-    RegisterAction<bit<16>, bit<15>, bit<16>>(packet_max_bank0) update_packet_max0 = {
-        void apply(inout bit<16> value, out bit<16> result) {
-            if (meta.packet_length > value) { value = meta.packet_length; }
-            if (value > CAP_PACKET_LENGTH_MAX) { value = CAP_PACKET_LENGTH_MAX; }
-            result = value;
-        }
-    };
-    RegisterAction<bit<16>, bit<15>, bit<16>>(packet_max_bank1) update_packet_max1 = {
-        void apply(inout bit<16> value, out bit<16> result) {
-            if (meta.packet_length > value) { value = meta.packet_length; }
-            if (value > CAP_PACKET_LENGTH_MAX) { value = CAP_PACKET_LENGTH_MAX; }
-            result = value;
-        }
-    };
-
-    RegisterAction<bit<16>, bit<15>, bit<16>>(psh_bank0) update_psh0 = {
-        void apply(inout bit<16> value, out bit<16> result) {
-            if (value < CAP_PSH_FLAG_COUNT) { value = value + (bit<16>) meta.packet_psh; }
-            result = value;
-        }
-    };
-    RegisterAction<bit<16>, bit<15>, bit<16>>(psh_bank1) update_psh1 = {
-        void apply(inout bit<16> value, out bit<16> result) {
-            if (value < CAP_PSH_FLAG_COUNT) { value = value + (bit<16>) meta.packet_psh; }
-            result = value;
-        }
-    };
-
-    RegisterAction<bit<16>, bit<15>, bit<16>>(total_fwd_bank0) update_total_fwd0 = {
-        void apply(inout bit<16> value, out bit<16> result) {
-            if (meta.total_fwd_increment > CAP_TOTAL_FWD_LENGTH) {
-                value = CAP_TOTAL_FWD_LENGTH;
-            } else if (value >= CAP_TOTAL_FWD_LENGTH - meta.total_fwd_increment) {
-                value = CAP_TOTAL_FWD_LENGTH;
+    action canonicalize() {
+        if (hdr.ipv4.src_addr < hdr.ipv4.dst_addr ||
+            (hdr.ipv4.src_addr == hdr.ipv4.dst_addr &&
+             (hdr.tcp.isValid() && hdr.tcp.src_port <= hdr.tcp.dst_port ||
+              hdr.udp.isValid() && hdr.udp.src_port <= hdr.udp.dst_port))) {
+            meta.low_addr = hdr.ipv4.src_addr;
+            meta.high_addr = hdr.ipv4.dst_addr;
+            meta.packet_low_to_high = 1;
+            if (hdr.tcp.isValid()) {
+                meta.low_port = hdr.tcp.src_port;
+                meta.high_port = hdr.tcp.dst_port;
             } else {
-                value = value + meta.total_fwd_increment;
+                meta.low_port = hdr.udp.src_port;
+                meta.high_port = hdr.udp.dst_port;
             }
-            result = value;
-        }
-    };
-    RegisterAction<bit<16>, bit<15>, bit<16>>(total_fwd_bank1) update_total_fwd1 = {
-        void apply(inout bit<16> value, out bit<16> result) {
-            if (meta.total_fwd_increment > CAP_TOTAL_FWD_LENGTH) {
-                value = CAP_TOTAL_FWD_LENGTH;
-            } else if (value >= CAP_TOTAL_FWD_LENGTH - meta.total_fwd_increment) {
-                value = CAP_TOTAL_FWD_LENGTH;
+        } else {
+            meta.low_addr = hdr.ipv4.dst_addr;
+            meta.high_addr = hdr.ipv4.src_addr;
+            meta.packet_low_to_high = 0;
+            if (hdr.tcp.isValid()) {
+                meta.low_port = hdr.tcp.dst_port;
+                meta.high_port = hdr.tcp.src_port;
             } else {
-                value = value + meta.total_fwd_increment;
+                meta.low_port = hdr.udp.dst_port;
+                meta.high_port = hdr.udp.src_port;
             }
-            result = value;
         }
-    };
-
-    RegisterAction<bit<16>, bit<15>, bit<16>>(fin_bank0) update_fin0 = {
-        void apply(inout bit<16> value, out bit<16> result) {
-            if (value < CAP_FIN_FLAG_COUNT) { value = value + (bit<16>) meta.packet_fin; }
-            result = value;
-        }
-    };
-    RegisterAction<bit<16>, bit<15>, bit<16>>(fin_bank1) update_fin1 = {
-        void apply(inout bit<16> value, out bit<16> result) {
-            if (value < CAP_FIN_FLAG_COUNT) { value = value + (bit<16>) meta.packet_fin; }
-            result = value;
-        }
-    };
-
-    RegisterAction<bit<16>, bit<15>, bit<16>>(fwd_max_bank0) update_fwd_max0 = {
-        void apply(inout bit<16> value, out bit<16> result) {
-            if (meta.fwd_packet_length > value) {
-                value = meta.fwd_packet_length;
-            }
-            if (value > CAP_FWD_PACKET_LENGTH_MAX) { value = CAP_FWD_PACKET_LENGTH_MAX; }
-            result = value;
-        }
-    };
-    RegisterAction<bit<16>, bit<15>, bit<16>>(fwd_max_bank1) update_fwd_max1 = {
-        void apply(inout bit<16> value, out bit<16> result) {
-            if (meta.fwd_packet_length > value) {
-                value = meta.fwd_packet_length;
-            }
-            if (value > CAP_FWD_PACKET_LENGTH_MAX) { value = CAP_FWD_PACKET_LENGTH_MAX; }
-            result = value;
-        }
-    };
-
-    RegisterAction<bit<16>, bit<15>, bit<16>>(bwd_packets_bank0) update_bwd0 = {
-        void apply(inout bit<16> value, out bit<16> result) {
-            if (value < CAP_TOTAL_BWD_PACKETS) { value = value + meta.bwd_packet_increment; }
-            result = value;
-        }
-    };
-    RegisterAction<bit<16>, bit<15>, bit<16>>(bwd_packets_bank1) update_bwd1 = {
-        void apply(inout bit<16> value, out bit<16> result) {
-            if (value < CAP_TOTAL_BWD_PACKETS) { value = value + meta.bwd_packet_increment; }
-            result = value;
-        }
-    };
-
-    action set_class(bit<8> class_id) {
-        meta.class_id = class_id;
     }
 
     action tcp_payload_40() { meta.packet_length = hdr.ipv4.total_len - 40; }
@@ -283,16 +205,11 @@ control SwitchIngress(
         size = 11;
         default_action = tcp_payload_40();
         const entries = {
-            4w5: tcp_payload_40();
-            4w6: tcp_payload_44();
-            4w7: tcp_payload_48();
-            4w8: tcp_payload_52();
-            4w9: tcp_payload_56();
-            4w10: tcp_payload_60();
-            4w11: tcp_payload_64();
-            4w12: tcp_payload_68();
-            4w13: tcp_payload_72();
-            4w14: tcp_payload_76();
+            4w5: tcp_payload_40(); 4w6: tcp_payload_44();
+            4w7: tcp_payload_48(); 4w8: tcp_payload_52();
+            4w9: tcp_payload_56(); 4w10: tcp_payload_60();
+            4w11: tcp_payload_64(); 4w12: tcp_payload_68();
+            4w13: tcp_payload_72(); 4w14: tcp_payload_76();
             4w15: tcp_payload_80();
         }
     }
@@ -315,89 +232,59 @@ control SwitchIngress(
     }
 
     apply {
-        bit<1> identity_result;
+        bit<2> probe_result;
         ig_tm_md.ucast_egress_port = ig_intr_md.ingress_port;
         meta.class_id = CLASS_BENIGN;
         meta.state_valid = 0;
-        meta.claimed = 0;
+        meta.mismatch_increment = 0;
+        meta.state_status = STATEDT_STATUS_NOT_PROCESSED;
 
         if (hdr.ipv4.isValid() && (hdr.tcp.isValid() || hdr.udp.isValid())) {
-            if (hdr.tcp.isValid()) {
-                tcp_payload_length.apply();
-                meta.low_port = hdr.tcp.src_port ^ hdr.tcp.dst_port;
-                meta.high_port = hdr.tcp.src_port + hdr.tcp.dst_port;
-                meta.src_port = hdr.tcp.src_port;
-            } else {
-                meta.packet_length = hdr.udp.length - 8;
-                meta.low_port = hdr.udp.src_port ^ hdr.udp.dst_port;
-                meta.high_port = hdr.udp.src_port + hdr.udp.dst_port;
-                meta.src_port = hdr.udp.src_port;
-            }
-            meta.low_addr = hdr.ipv4.src_addr ^ hdr.ipv4.dst_addr;
-            meta.high_addr = hdr.ipv4.src_addr + hdr.ipv4.dst_addr;
-            meta.endpoint_fingerprint = endpoint_hash.get({ hdr.ipv4.src_addr,
-                hdr.ipv4.protocol, meta.src_port }) | 16w1;
             meta.packet_psh = 0;
             meta.packet_fin = 0;
             if (hdr.tcp.isValid()) {
+                tcp_payload_length.apply();
                 meta.packet_psh = hdr.tcp.psh;
                 meta.packet_fin = hdr.tcp.fin;
+            } else {
+                meta.packet_length = hdr.udp.length - 8;
             }
+            canonicalize();
             meta.index0 = index_hash0.get({ meta.low_addr, meta.high_addr,
                 hdr.ipv4.protocol, meta.low_port, meta.high_port, 8w0x31 });
             meta.index1 = index_hash1.get({ meta.low_addr, meta.high_addr,
                 hdr.ipv4.protocol, meta.low_port, meta.high_port, 8w0xa7 });
             meta.fingerprint = fingerprint_hash.get({ meta.low_addr, meta.high_addr,
-                hdr.ipv4.protocol, meta.low_port, meta.high_port }) | 16w1;
+                hdr.ipv4.protocol, meta.low_port, meta.high_port });
 
-            identity_result = claim_bank0.execute(meta.index0);
-            if (identity_result == 1) {
-                meta.claimed = 1;
-                meta.selected_bank = 0;
-                meta.forward = direction_bank0.execute(meta.index0);
-            } else {
-                identity_result = claim_bank1.execute(meta.index1);
-                if (identity_result == 1) {
-                    meta.claimed = 1;
-                    meta.selected_bank = 1;
-                    meta.forward = direction_bank1.execute(meta.index1);
+            probe_result = access_bank0.execute(meta.index0);
+            if (probe_result == STATEDT_STATUS_NOT_PROCESSED) {
+                meta.mismatch_increment = 1;
+                probe_result = access_bank1.execute(meta.index1);
+                if (probe_result == STATEDT_STATUS_NOT_PROCESSED) {
+                    meta.mismatch_increment = 2;
+                    meta.counter_value = count_collision.execute(1w0);
+                    meta.counter_value = count_fallback.execute(1w0);
+                    meta.state_status = STATEDT_STATUS_FALLBACK_COLLISION;
                 }
             }
-
-            meta.fwd_packet_length = 0;
-            meta.total_fwd_increment = 0;
-            meta.bwd_packet_increment = 0;
-            if (meta.forward == 1) {
-                meta.fwd_packet_length = meta.packet_length;
-                meta.total_fwd_increment = meta.packet_length;
-            } else {
-                meta.bwd_packet_increment = 1;
+            if (meta.mismatch_increment != 0) {
+                meta.counter_value = count_mismatch.execute(1w0);
             }
-
-            if (meta.claimed == 1 && meta.selected_bank == 0) {
-                meta.features.packet_length_max = update_packet_max0.execute(meta.index0);
-                meta.features.psh_flag_count = update_psh0.execute(meta.index0);
-                meta.features.total_fwd_length = update_total_fwd0.execute(meta.index0);
-                meta.features.fin_flag_count = update_fin0.execute(meta.index0);
-                meta.features.fwd_packet_length_max = update_fwd_max0.execute(meta.index0);
-                meta.features.total_bwd_packets = update_bwd0.execute(meta.index0);
-            } else if (meta.claimed == 1) {
-                meta.features.packet_length_max = update_packet_max1.execute(meta.index1);
-                meta.features.psh_flag_count = update_psh1.execute(meta.index1);
-                meta.features.total_fwd_length = update_total_fwd1.execute(meta.index1);
-                meta.features.fin_flag_count = update_fin1.execute(meta.index1);
-                meta.features.fwd_packet_length_max = update_fwd_max1.execute(meta.index1);
-                meta.features.total_bwd_packets = update_bwd1.execute(meta.index1);
-            }
-
-            if (meta.claimed == 1) {
+            if (probe_result != STATEDT_STATUS_NOT_PROCESSED) {
                 meta.state_valid = 1;
+                meta.state_status = probe_result;
+                if (probe_result == STATEDT_STATUS_ALLOCATED) {
+                    meta.counter_value = count_allocation.execute(1w0);
+                }
                 classify.apply();
             }
+
             hdr.result.setValid();
             hdr.result.original_ether_type = ETHERTYPE_IPV4;
             hdr.result.class_id = meta.class_id;
             hdr.result.state_valid = meta.state_valid;
+            hdr.result.state_status = meta.state_status;
             hdr.result.reserved = 0;
             hdr.ethernet.ether_type = ETHERTYPE_STATEDT;
         }

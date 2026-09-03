@@ -191,5 +191,23 @@ def estimate_leo_resources(target: TargetProfile, num_features: int, tree_entrie
     return _tree_report(target, num_features, tree_entries, extra_stages=state_update_stages(num_features, target), state_bits=state_bits, metadata_bits=1)
 
 
-def estimate_statedt_resources(target: TargetProfile, tree_entries: int, feature_state_bits: int, metadata_bits: int, num_features: int) -> ResourceReport:
-    return _tree_report(target, num_features, tree_entries, extra_stages=state_update_stages(num_features, target), state_bits=feature_state_bits, metadata_bits=metadata_bits)
+def estimate_statedt_resources(
+    target: TargetProfile,
+    tree_entries: int,
+    feature_state_bits: int,
+    num_features: int,
+    *,
+    fingerprint_bits: int,
+    direction_bits: int,
+    valid_bits: int,
+) -> ResourceReport:
+    """Estimate the exact canonical StateDT entry, excluding global counters."""
+    metadata_bits = fingerprint_bits + direction_bits + valid_bits
+    return _tree_report(
+        target,
+        num_features,
+        tree_entries,
+        extra_stages=state_update_stages(num_features, target),
+        state_bits=feature_state_bits,
+        metadata_bits=metadata_bits,
+    )

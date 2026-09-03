@@ -78,17 +78,11 @@ class AdaFlowConfig(BasicTreeConfig):
 
 @dataclass(frozen=True)
 class StateDTConfig(BasicTreeConfig):
-    stateful_only: bool
     explicit_features: tuple[str, ...]
-    scaling_aware: bool
-    validation_folds: int
-    max_f1_drop: float
     fingerprint_bits: int
-    generation_bits: int
+    direction_bits: int
     valid_bits: int
-    allocator: str
     fallback: str
-    exact_equivalence: bool
 
 
 @dataclass(frozen=True)
@@ -128,12 +122,6 @@ def _positive_int(value: Any, name: str) -> int:
 def _positive_float(value: Any, name: str) -> float:
     if not isinstance(value, (int, float)) or value <= 0:
         raise ValueError(f"{name} must be a positive number")
-    return float(value)
-
-
-def _bounded_float(value: Any, name: str, minimum: float, maximum: float) -> float:
-    if not isinstance(value, (int, float)) or not minimum <= float(value) <= maximum:
-        raise ValueError(f"{name} must be in [{minimum}, {maximum}]")
     return float(value)
 
 
@@ -269,36 +257,31 @@ def load_experiment_config(path: str) -> ExperimentConfig:
     state = statedt_raw.get("state") or {}
     if state.get("allocator") != "two_choice":
         raise ValueError("statedt.state.allocator must be 'two_choice'")
-    validation_folds = _positive_int(
-        selection.get("validation_folds", 3),
-        "statedt.feature_selection.validation_folds",
-    )
-    if validation_folds < 2:
-        raise ValueError("statedt.feature_selection.validation_folds must be at least 2")
+    if not bool(statedt_raw.get("exact_equivalence", True)):
+        raise ValueError("statedt.exact_equivalence must be true")
     statedt = StateDTConfig(
         max_depth=_positive_int(statedt_raw.get("max_depth"), "statedt.max_depth"),
         max_features=_positive_int(statedt_raw.get("max_features"), "statedt.max_features"),
-        stateful_only=bool(selection.get("stateful_only", True)),
-        explicit_features=tuple(str(item) for item in selection.get("explicit_features", []) or []),
-        scaling_aware=bool(selection.get("scaling_aware", True)),
-        validation_folds=validation_folds,
-        max_f1_drop=_bounded_float(
-            selection.get("max_f1_drop", 0.02),
-            "statedt.feature_selection.max_f1_drop",
-            0.0,
-            1.0,
+        explicit_features=tuple(
+            str(item) for item in selection.get("explicit_features", []) or []
         ),
-        fingerprint_bits=_positive_int(state.get("fingerprint_bits"), "statedt.state.fingerprint_bits"),
-        generation_bits=_positive_int(state.get("generation_bits"), "statedt.state.generation_bits"),
+        fingerprint_bits=_positive_int(
+            state.get("fingerprint_bits"), "statedt.state.fingerprint_bits"
+        ),
+        direction_bits=_positive_int(
+            state.get("direction_bits", 1), "statedt.state.direction_bits"
+        ),
         valid_bits=_positive_int(state.get("valid_bits"), "statedt.state.valid_bits"),
-        allocator=str(state.get("allocator")),
         fallback=str(statedt_raw.get("fallback", "majority_class")),
-        exact_equivalence=bool(statedt_raw.get("exact_equivalence", True)),
     )
-    if not statedt.exact_equivalence:
-        raise ValueError("statedt.exact_equivalence must be true")
     if statedt.fallback not in {"majority_class", "no_prediction"}:
         raise ValueError("statedt.fallback must be 'majority_class' or 'no_prediction'")
+    if statedt.fingerprint_bits != 16:
+        raise ValueError("statedt.state.fingerprint_bits must be 16 for the P4 targets")
+    if statedt.valid_bits != 1:
+        raise ValueError("statedt.state.valid_bits must be 1")
+    if statedt.direction_bits != 1:
+        raise ValueError("statedt.state.direction_bits must be 1")
 
     return ExperimentConfig(
         path=config_path,

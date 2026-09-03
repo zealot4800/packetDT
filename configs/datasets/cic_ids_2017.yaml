@@ -50,11 +50,10 @@ statedt:
   max_depth: 15
   max_features: 6
   feature_selection:
-    stateful_only: true
     explicit_features: []
   state:
     fingerprint_bits: 16
-    generation_bits: 4
+    direction_bits: 1
     valid_bits: 1
     allocator: "two_choice"
   fallback: "majority_class"

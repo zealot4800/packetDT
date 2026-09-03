@@ -3,7 +3,7 @@
 #include "../common/statedt_headers.p4"
 #include "../common/statedt_model.p4inc"
 #include "../common/statedt_layout.p4inc"
-#include "../common/statedt_bmv2_type.p4inc"
+#include "../common/statedt_entry_type.p4inc"
 
 const bit<32> FLOW_BANK_SIZE = 32w32768;
 
@@ -16,9 +16,10 @@ struct metadata_t {
     bit<32> index0;
     bit<32> index1;
     bit<16> fingerprint;
-    bit<1> claimed;
+    bit<16> packet_length;
     bit<1> forward;
     bit<1> state_valid;
+    bit<2> state_status;
     bit<8> class_id;
     statedt_entry_t state;
     flow_features_t features;
@@ -69,6 +70,10 @@ control StateDTIngress(
         inout standard_metadata_t standard_metadata) {
     register<statedt_entry_t>(FLOW_BANK_SIZE) flow_bank0;
     register<statedt_entry_t>(FLOW_BANK_SIZE) flow_bank1;
+    counter(1, CounterType.packets) statedt_allocations;
+    counter(1, CounterType.packets) statedt_fingerprint_mismatches;
+    counter(1, CounterType.packets) statedt_collisions;
+    counter(1, CounterType.packets) statedt_fallbacks;
 
     action set_class(bit<8> class_id) {
         meta.class_id = class_id;
@@ -123,15 +128,14 @@ control StateDTIngress(
     }
 
     action update_state() {
-        bit<16> packet_length;
         bit<16> incoming_region;
         bit<17> total;
 
         if (hdr.tcp.isValid()) {
-            packet_length = hdr.ipv4.total_len - ((bit<16>) hdr.ipv4.ihl << 2) -
+            meta.packet_length = hdr.ipv4.total_len - ((bit<16>) hdr.ipv4.ihl << 2) -
                 ((bit<16>) hdr.tcp.data_offset << 2);
         } else {
-            packet_length = hdr.udp.length - 8;
+            meta.packet_length = hdr.udp.length - 8;
         }
 
 #include "../common/statedt_unpack_features.p4inc"
@@ -153,7 +157,7 @@ control StateDTIngress(
         }
 
         if (meta.forward == 1) {
-            total = (bit<17>) meta.features.total_fwd_length + (bit<17>) packet_length;
+            total = (bit<17>) meta.features.total_fwd_length + (bit<17>) meta.packet_length;
             if (total > (bit<17>) CAP_TOTAL_FWD_LENGTH) {
                 meta.features.total_fwd_length = CAP_TOTAL_FWD_LENGTH;
             } else {
@@ -179,14 +183,19 @@ control StateDTIngress(
             meta.state[STATEDT_DIRECTION_BIT:STATEDT_DIRECTION_BIT] = meta.packet_low_to_high;
             meta.state[STATEDT_FINGERPRINT_MSB:STATEDT_FINGERPRINT_LSB] = meta.fingerprint;
             meta.forward = 1;
-            meta.claimed = 1;
+            meta.state_valid = 1;
+            meta.state_status = STATEDT_STATUS_ALLOCATED;
+            statedt_allocations.count(0);
             update_state();
             flow_bank0.write(meta.index0, meta.state);
         } else if (meta.state[STATEDT_FINGERPRINT_MSB:STATEDT_FINGERPRINT_LSB] == meta.fingerprint) {
             meta.forward = (bit<1>)(meta.state[STATEDT_DIRECTION_BIT:STATEDT_DIRECTION_BIT] == meta.packet_low_to_high);
-            meta.claimed = 1;
+            meta.state_valid = 1;
+            meta.state_status = STATEDT_STATUS_MATCH;
             update_state();
             flow_bank0.write(meta.index0, meta.state);
+        } else {
+            statedt_fingerprint_mismatches.count(0);
         }
     }
 
@@ -198,14 +207,22 @@ control StateDTIngress(
             meta.state[STATEDT_DIRECTION_BIT:STATEDT_DIRECTION_BIT] = meta.packet_low_to_high;
             meta.state[STATEDT_FINGERPRINT_MSB:STATEDT_FINGERPRINT_LSB] = meta.fingerprint;
             meta.forward = 1;
-            meta.claimed = 1;
+            meta.state_valid = 1;
+            meta.state_status = STATEDT_STATUS_ALLOCATED;
+            statedt_allocations.count(0);
             update_state();
             flow_bank1.write(meta.index1, meta.state);
         } else if (meta.state[STATEDT_FINGERPRINT_MSB:STATEDT_FINGERPRINT_LSB] == meta.fingerprint) {
             meta.forward = (bit<1>)(meta.state[STATEDT_DIRECTION_BIT:STATEDT_DIRECTION_BIT] == meta.packet_low_to_high);
-            meta.claimed = 1;
+            meta.state_valid = 1;
+            meta.state_status = STATEDT_STATUS_MATCH;
             update_state();
             flow_bank1.write(meta.index1, meta.state);
+        } else {
+            meta.state_status = STATEDT_STATUS_FALLBACK_COLLISION;
+            statedt_fingerprint_mismatches.count(0);
+            statedt_collisions.count(0);
+            statedt_fallbacks.count(0);
         }
     }
 
@@ -213,7 +230,7 @@ control StateDTIngress(
         standard_metadata.egress_spec = standard_metadata.ingress_port;
         meta.class_id = CLASS_BENIGN;
         meta.state_valid = 0;
-        meta.claimed = 0;
+        meta.state_status = STATEDT_STATUS_NOT_PROCESSED;
 
         if (hdr.ipv4.isValid() && (hdr.tcp.isValid() || hdr.udp.isValid())) {
             canonicalize();
@@ -228,11 +245,10 @@ control StateDTIngress(
                    meta.low_port, meta.high_port }, 16w65535);
 
             try_bank0();
-            if (meta.claimed == 0) {
+            if (meta.state_valid == 0) {
                 try_bank1();
             }
-            if (meta.claimed == 1) {
-                meta.state_valid = 1;
+            if (meta.state_valid == 1) {
                 classify.apply();
             }
 
@@ -240,6 +256,7 @@ control StateDTIngress(
             hdr.result.original_ether_type = ETHERTYPE_IPV4;
             hdr.result.class_id = meta.class_id;
             hdr.result.state_valid = meta.state_valid;
+            hdr.result.state_status = meta.state_status;
             hdr.result.reserved = 0;
             hdr.ethernet.ether_type = ETHERTYPE_STATEDT;
         }
